@@ -1,0 +1,24 @@
+{
+    "2025-07-28": [
+        {
+            "time": "10:00",
+            "title": "Python 基礎入門",
+            "description": "介紹 Python 的基本語法、變數與迴圈。",
+            "teacher": "範例老師A"
+        },
+        {
+            "time": "14:00",
+            "title": "Discord.py 機器人開發",
+            "description": "從零開始，建立你的第一個 Discord Bot。",
+            "teacher": "範例老師B"
+        }
+    ],
+    "2025-07-29": [
+        {
+            "time": "20:00",
+            "title": "Git 與 GitHub 入門",
+            "description": "學習版本控制的基礎，並將專案上傳到 GitHub。",
+            "teacher": "範例老師C"
+        }
+    ]
+}

@@ -20,5 +20,29 @@
             "description": "學習版本控制的基礎，並將專案上傳到 GitHub。",
             "teacher": "範例老師C"
         }
+    ],
+    "2025-10-10": [
+        {
+            "time": "10:00",
+            "title": "py",
+            "description": "test",
+            "teacher": "羊羊"
+        }
+    ],
+    "2025-09-17": [
+        {
+            "time": "20:00",
+            "title": "py",
+            "description": "test",
+            "teacher": "羊羊"
+        }
+    ],
+    "2025-09-19": [
+        {
+            "time": "9:00",
+            "title": "19日測試",
+            "description": "test",
+            "teacher": "羊羊"
+        }
     ]
 }

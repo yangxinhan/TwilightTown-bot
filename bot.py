@@ -47,7 +47,12 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
             await interaction.response.send_message("您必須輸入「同意」才能提交申請。", ephemeral=True)
             return
 
-        request_channel = bot.get_channel(TUTORING_REQUEST_CHANNEL_ID)
+        request_channel_id = os.getenv("TUTORING_REQUEST_CHANNEL_ID")
+        if not request_channel_id:
+            await interaction.response.send_message("錯誤：未設定輔導申請頻道ID，請聯絡管理員。", ephemeral=True)
+            return
+
+        request_channel = bot.get_channel(int(request_channel_id))
         if not request_channel:
             await interaction.response.send_message("錯誤：找不到輔導申請頻道，請聯絡管理員。", ephemeral=True)
             return
@@ -129,7 +134,12 @@ class ReportModal(ui.Modal, title="匿名檢舉"):
     evidence = ui.TextInput(label="相關證據 (選填)", style=discord.TextStyle.paragraph, placeholder="可貼上圖片連結或訊息連結", required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
-        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
+        if not admin_channel_id:
+            await interaction.response.send_message("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
+            return
+
+        admin_channel = bot.get_channel(int(admin_channel_id))
         if not admin_channel:
             await interaction.response.send_message("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
             return
@@ -175,7 +185,7 @@ schedule_group = app_commands.Group(name="schedule", description="課表相關�
 async def add_class(interaction: discord.Interaction, date: str, time: str, title: str, description: str):
     # 簡易的權限檢查，只允許有 "老師" 角色的使用者操作
     # 在您的伺服器中，請確保教師們都有一個名為 "老師" 的角色
-    if not any(role.name == '老師' for role in interaction.user.roles):
+    if not any(role.name == '進駐講師' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有教師才能新增課程。", ephemeral=True)
         return
 

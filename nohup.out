@@ -1,0 +1,4 @@
+[2025-10-01 04:13:06] [INFO    ] discord.client: logging in using static token
+[2025-10-01 04:13:08] [INFO    ] discord.gateway: Shard ID None has connected to Gateway (Session ID: 2cc17f4451f2d35e0adba2130d5e3a21).
+Logged in as TwilightTown-bot
+Bot is ready to use.

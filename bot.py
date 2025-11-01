@@ -5,6 +5,32 @@ import os
 from dotenv import load_dotenv
 import json
 from datetime import datetime
+from typing import Optional, List
+
+# 檢舉文件確認按鈕 View
+class ConfirmReportView(ui.View):
+    def __init__(self, report_data: dict):
+        super().__init__(timeout=600)  # 10 分鐘逾時
+        self.report_data = report_data
+
+    @ui.button(label="📎 新增附件並提交", style=discord.ButtonStyle.primary, custom_id="add_attachments_submit")
+    async def add_attachments(self, interaction: discord.Interaction, button: ui.Button):
+        """開啟檔案上傳對話"""
+        await interaction.response.send_modal(AttachmentUploadModal(report_data=self.report_data))
+        self.stop()
+
+    @ui.button(label="✅ 直接提交 (無附件)", style=discord.ButtonStyle.success, custom_id="direct_submit")
+    async def direct_submit(self, interaction: discord.Interaction, button: ui.Button):
+        """直接提交檢舉，不附加檔案"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await dispatch_anonymous_report(
+            interaction=interaction,
+            target_user=self.report_data["target_user"],
+            reason=self.report_data["reason"],
+            additional_context=self.report_data.get("additional_context"),
+            attachments=[]
+        )
+        self.stop()
 
 # --- 環境變數與常數定義 ---
 load_dotenv()
@@ -127,35 +153,170 @@ class TutoringRequestView(ui.View):
         await self.applicant.send(f"很遺憾，您的輔導申請已被婉拒。若有疑問請聯繫管理員。")
         print(f"導師 {interaction.user.name} 婉拒了 {self.applicant.name} 的申請。")
 
-# 2. 匿名檢舉表單 (Modal)
-class ReportModal(ui.Modal, title="匿名檢舉"):
-    target_user = ui.TextInput(label="檢舉對象的使用者名稱或ID", required=True)
-    reason = ui.TextInput(label="事由", style=discord.TextStyle.paragraph, placeholder="請詳細說明事發經過...", required=True)
-    evidence = ui.TextInput(label="相關證據 (選填)", style=discord.TextStyle.paragraph, placeholder="可貼上圖片連結或訊息連結", required=False)
+# 2. 匿名檢舉流程 (Slash Command)
+class ReportModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="匿名檢舉")
 
-    async def on_submit(self, interaction: discord.Interaction):
-        admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
-        if not admin_channel_id:
-            await interaction.response.send_message("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
-            return
-
-        admin_channel = bot.get_channel(int(admin_channel_id))
-        if not admin_channel:
-            await interaction.response.send_message("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="⚠️ 收到新的匿名檢舉",
-            color=discord.Color.orange()
+        self.target_user_input = ui.TextInput(
+            label="檢舉對象的使用者名稱或ID",
+            placeholder="請輸入對方的暱稱或 Discord ID",
+            required=True
         )
-        embed.add_field(name="檢舉對象", value=self.target_user.value, inline=False)
-        embed.add_field(name="事由", value=self.reason.value, inline=False)
-        embed.add_field(name="證據", value=self.evidence.value or "無提供", inline=False)
-        embed.set_footer(text="此為匿名檢舉，請管理員謹慎處理。")
+        self.add_item(self.target_user_input)
 
-        await admin_channel.send(embed=embed)
-        await interaction.response.send_message("您的檢舉已匿名送出，管理團隊將會進行處理，感謝您的回報。", ephemeral=True)
-        print(f"收到一則匿名檢舉，對象：{self.target_user.value}")
+        self.reason_input = ui.TextInput(
+            label="事由",
+            style=discord.TextStyle.paragraph,
+            placeholder="請詳細說明事發經過...",
+            required=True,
+            max_length=1900
+        )
+        self.add_item(self.reason_input)
+
+        self.additional_context_input = ui.TextInput(
+            label="補充說明 / 證據連結 (選填)",
+            style=discord.TextStyle.paragraph,
+            placeholder="可貼上圖片連結、訊息連結或補充資訊",
+            required=False,
+            max_length=1900
+        )
+        self.add_item(self.additional_context_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        report_data = {
+            "target_user": self.target_user_input.value,
+            "reason": self.reason_input.value,
+            "additional_context": self.additional_context_input.value
+        }
+        
+        await interaction.response.send_message(
+            "檢舉資訊已確認。請選擇是否新增檔案證據：",
+            view=ConfirmReportView(report_data=report_data),
+            ephemeral=True
+        )
+
+
+# 檔案上傳對話 Modal
+class AttachmentUploadModal(ui.Modal):
+    def __init__(self, report_data: dict):
+        super().__init__(title="上傳檢舉證據")
+        self.report_data = report_data
+
+        self.note_input = ui.TextInput(
+            label="附件說明 (選填)",
+            style=discord.TextStyle.paragraph,
+            placeholder="請說明這些附件代表的內容\n附件說明的內容可不打，提交後機器人會私訊您，請在私訊框中提交附件",
+            required=False,
+            max_length=1900
+        )
+        self.add_item(self.note_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        # 提示使用者開啟 DM 上傳檔案
+        try:
+            dm_channel = await interaction.user.create_dm()
+            await dm_channel.send(
+                "👋 請在此 DM 中回覆並附上檔案。\n"
+                "點擊訊息框旁的「➕」按鈕，選擇「上傳檔案」來附加圖片或其他檔案。\n"
+                "完成後傳送訊息即可，系統會自動將您的檢舉送出。\n\n"
+                "⏱️ 請在 10 分鐘內完成上傳。\n"
+                "請一次上傳完畢所有附件，並在同一則訊息中傳送。\n"
+                "如檔案太多請分兩次檢舉"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ 無法傳送私訊給您。請先開啟伺服器中其他成員的 DM，或檢查隱私設定。",
+                ephemeral=True
+            )
+            return
+
+        def check(msg: discord.Message) -> bool:
+            return (msg.author == interaction.user and 
+                    msg.channel.type == discord.ChannelType.private and 
+                    len(msg.attachments) > 0)
+
+        try:
+            message = await bot.wait_for("message", check=check, timeout=600)
+            attachments = message.attachments
+        except:
+            await dm_channel.send("⏱️ 上傳超時，檢舉已取消。若需重新檢舉請使用 `/report` 指令。")
+            await interaction.followup.send("⏱️ 上傳超時，已取消檢舉。", ephemeral=True)
+            return
+
+        additional_context = self.report_data.get("additional_context", "")
+        if self.note_input.value:
+            if additional_context:
+                additional_context += f"\n附件說明：{self.note_input.value}"
+            else:
+                additional_context = f"附件說明：{self.note_input.value}"
+
+        await dispatch_anonymous_report(
+            interaction=interaction,
+            target_user=self.report_data["target_user"],
+            reason=self.report_data["reason"],
+            additional_context=additional_context,
+            attachments=list(attachments)
+        )
+        
+        await dm_channel.send("✅ 您的檢舉已送出，感謝您的回報！")
+
+
+
+async def dispatch_anonymous_report(
+    interaction: discord.Interaction,
+    target_user: str,
+    reason: str,
+    additional_context: Optional[str] = None,
+    attachments: Optional[List[discord.Attachment]] = None
+) -> None:
+    """將匿名檢舉送至管理員頻道，並處理附件下載。"""
+    admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
+    if not admin_channel_id:
+        await interaction.followup.send("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
+        return
+
+    admin_channel = bot.get_channel(int(admin_channel_id))
+    if not admin_channel:
+        await interaction.followup.send("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚠️ 收到新的匿名檢舉",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="檢舉對象", value=target_user, inline=False)
+    embed.add_field(name="事由", value=reason, inline=False)
+
+    evidence_lines = []
+    if additional_context:
+        evidence_lines.append(additional_context)
+    if attachments:
+        evidence_lines.append(f"附件數量：{len(attachments)}")
+
+    embed.add_field(name="證據/補充", value="\n".join(evidence_lines) if evidence_lines else "無提供", inline=False)
+    embed.set_footer(text="此為匿名檢舉，請管理員謹慎處理。")
+
+    files_to_forward = []
+    for attachment in attachments or []:
+        try:
+            files_to_forward.append(await attachment.to_file())
+        except (discord.HTTPException, discord.Forbidden) as fetch_error:
+            await interaction.followup.send(
+                f"無法取得附件 `{attachment.filename}`，請稍後重試或改以其他方式提供。\n錯誤：{fetch_error}",
+                ephemeral=True
+            )
+            return
+
+    send_kwargs = {"embed": embed}
+    if files_to_forward:
+        send_kwargs["files"] = files_to_forward
+
+    await admin_channel.send(**send_kwargs)
+    await interaction.followup.send("您的檢舉已匿名送出，管理團隊將會進行處理，感謝您的回報。", ephemeral=True)
+    print(f"收到一則匿名檢舉，對象：{target_user}，附件數量：{len(files_to_forward)}")
 
 # --- Bot 事件監聽 ---
 @bot.event
@@ -169,6 +330,7 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(e)
+
 
 # --- 斜線指令定義 ---
 
@@ -185,7 +347,7 @@ schedule_group = app_commands.Group(name="schedule", description="課表相關�
 async def add_class(interaction: discord.Interaction, date: str, time: str, title: str, description: str):
     # 簡易的權限檢查，只允許有 "老師" 角色的使用者操作
     # 在您的伺服器中，請確保教師們都有一個名為 "老師" 的角色
-    if not any(role.name == '進駐講師' for role in interaction.user.roles):
+    if not any(role.name == '鎮民' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有教師才能新增課程。", ephemeral=True)
         return
 

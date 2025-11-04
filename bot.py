@@ -4,7 +4,7 @@ from discord import app_commands, ui
 import os
 from dotenv import load_dotenv
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 # 檢舉文件確認按鈕 View
@@ -38,6 +38,7 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
 SCHEDULE_FILE = "schedule.json"
+TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
 # --- 課表資料處理 ---
 def load_schedule():
@@ -91,18 +92,33 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
         embed.add_field(name="主題", value=self.topic.value, inline=False)
         embed.add_field(name="偏好導師", value=self.tutor.value or "無指定", inline=False)
         embed.add_field(name="可配合時段", value=self.schedule.value, inline=False)
-        embed.set_footer(text=f"申請人 ID: {interaction.user.id}")
+        embed.set_footer(text=f"申請人 ID: {interaction.user.id} | ⏰ 24 小時內回應")
 
-        view = TutoringRequestView(applicant=interaction.user)
+        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow())
         await request_channel.send(embed=embed, view=view)
         await interaction.response.send_message("您的輔導申請已成功送出，請靜候導師回覆。", ephemeral=True)
         print(f"使用者 {interaction.user} 提交了輔導申請。")
 
 # 1b. 輔導申請的按鈕 (View)
 class TutoringRequestView(ui.View):
-    def __init__(self, applicant: discord.Member):
-        super().__init__(timeout=None) # timeout=None 讓按鈕永久有效
+    def __init__(self, applicant: discord.Member, created_at: datetime):
+        super().__init__(timeout=TUTORING_REQUEST_TIMEOUT)  # 24 小時逾時
         self.applicant = applicant
+        self.created_at = created_at
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """檢查時間限制與按鈕權限"""
+        # 檢查是否超過 24 小時
+        if datetime.utcnow() - self.created_at > timedelta(seconds=TUTORING_REQUEST_TIMEOUT):
+            await interaction.response.send_message(
+                "❌ 此申請已超過 24 小時回應期限，請要求申請人重新提交申請。",
+                ephemeral=True
+            )
+            return False
+
+        # 檢查按鈕權限：只有指定的導師或無指定時任何導師都可操作
+        # 這裡使用簡單邏輯，實際可根據申請時的偏好導師進行檢查
+        return True
 
     @ui.button(label="✅ 接單", style=discord.ButtonStyle.success, custom_id="accept_tutoring")
     async def accept(self, interaction: discord.Interaction, button: ui.Button):
@@ -323,7 +339,7 @@ async def dispatch_anonymous_report(
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
     # 如果View是設計成永久有效的，需要這段來重載
-    bot.add_view(TutoringRequestView(applicant=None))
+    bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow()))
     print(f'Bot is ready to use.')
     try:
         synced = await bot.tree.sync()
@@ -428,6 +444,61 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         
     await interaction.response.send_message(embed=embed)
 
+@schedule_group.command(name="cancel", description="[教師用] 取消一堂課")
+@app_commands.describe(
+    date="課程日期 (格式：YYYY-MM-DD)",
+    time="課程時間 (格式：HH:MM)"
+)
+async def cancel_class(interaction: discord.Interaction, date: str, time: str):
+    # 權限檢查
+    if not any(role.name == '鎮民' for role in interaction.user.roles):
+        await interaction.response.send_message("抱歉，只有教師才能取消課程。", ephemeral=True)
+        return
+
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+        datetime.strptime(time, "%H:%M")
+    except ValueError:
+        await interaction.response.send_message("日期或時間格式錯誤！請使用 `YYYY-MM-DD` 和 `HH:MM` 格式。", ephemeral=True)
+        return
+
+    schedule = load_schedule()
+    
+    if date not in schedule or not schedule[date]:
+        await interaction.response.send_message(f"❌ 在 {date} 沒有任何課程。", ephemeral=True)
+        return
+
+    # 尋找要取消的課程
+    course_to_cancel = None
+    for course in schedule[date]:
+        if course['time'] == time:
+            course_to_cancel = course
+            break
+
+    if course_to_cancel is None:
+        await interaction.response.send_message(f"❌ 在 {date} {time} 沒有找到課程。", ephemeral=True)
+        return
+
+    # 檢查是否為本人的課程
+    if course_to_cancel['teacher'] != interaction.user.display_name:
+        await interaction.response.send_message("❌ 您只能取消自己的課程。", ephemeral=True)
+        return
+
+    # 移除課程
+    schedule[date].remove(course_to_cancel)
+    
+    # 若該日期已無課程，刪除該日期
+    if not schedule[date]:
+        del schedule[date]
+
+    save_schedule(schedule)
+
+    await interaction.response.send_message(
+        f"✅ 課程 **{course_to_cancel['title']}** (於 {date} {time}) 已成功取消。",
+        ephemeral=True
+    )
+    print(f"教師 {interaction.user.display_name} 取消了課程：{date} {time} - {course_to_cancel['title']}")
+
 bot.tree.add_command(schedule_group)
 
 # 1. 一對一輔導申請指令
@@ -440,20 +511,73 @@ async def apply_tutoring(interaction: discord.Interaction):
 async def report(interaction: discord.Interaction):
     await interaction.response.send_modal(ReportModal())
 
-# 3. 規則查詢指令
-@bot.tree.command(name="rules", description="顯示微光鎮的核心互動規則")
+# 3. 指令使用指南
+@bot.tree.command(name="rules", description="顯示微光鎮所有指令的使用方式")
 async def rules(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="📜 微光鎮互動安全規則",
-        description="為了保障每位成員，請遵守以下互動原則。",
+        title="� 微光鎮指令使用指南",
+        description="以下是本伺服器提供的所有指令及其使用方式。",
         color=discord.Color.gold()
     )
-    embed.add_field(name="🔒 一對一輔導", value="所有一對一輔導皆需透過 `/apply-tutoring` 指令申請，禁止私下約談。", inline=False)
-    embed.add_field(name="🚫 禁止私下聯絡", value="導師與學生不可私下透過非平台渠道聯繫。如有必要，需向管理員申報。", inline=False)
-    embed.add_field(name="📹 錄音與陪同", value="所有一對一對談建議錄音或有第三者陪同，以保障雙方權益。", inline=False)
-    embed.add_field(name="🔞 未成年者互動", value="與未成年者互動需更加謹慎，禁止任何形式的單獨私下見面。", inline=False)
-    embed.add_field(name="📬 匿名檢舉", value="若發現任何違規行為，可使用 `/report` 指令進行匿名檢舉。", inline=False)
-    embed.set_footer(text="微光鎮感謝您的合作")
+    
+    # 課表相關指令
+    embed.add_field(
+        name="� 課表指令群組 (`/schedule`)",
+        value=(
+            "• **`/schedule add`**\n"
+            "  新增一堂課至課表。需要提供課程日期 (YYYY-MM-DD)、時間 (HH:MM)、標題、描述。\n\n"
+            "• **`/schedule today`**\n"
+            "  查詢今日的課表。\n\n"
+            "• **`/schedule view`**\n"
+            "  查詢指定日期的課表。需要提供日期 (YYYY-MM-DD)。\n\n"
+            "• **`/schedule cancel`**\n"
+            "  取消一堂課。只能取消自己的課程，需要提供日期和時間。"
+        ),
+        inline=False
+    )
+    
+    # 輔導相關指令
+    embed.add_field(
+        name="🎓 一對一輔導 (`/apply-tutoring`)",
+        value=(
+            "申請一對一線上輔導。執行後會彈出申請表，填寫內容包括：\n"
+            "• 想請教的主題\n"
+            "• 希望的導師 (選填)\n"
+            "• 可配合的時段\n"
+            "• 同意錄音/陪同條款\n\n"
+            "提交後導師可接單或婉拒，接單時會建立臨時私人討論頻道。"
+        ),
+        inline=False
+    )
+    
+    # 檢舉相關指令
+    embed.add_field(
+        name="⚠️ 匿名檢舉 (`/report`)",
+        value=(
+            "匿名檢舉違規行為。執行後會彈出檢舉表，流程如下：\n"
+            "1️⃣ 填寫檢舉對象、事由、補充說明\n"
+            "2️⃣ 提交後選擇是否上傳附件：\n"
+            "   • 選「新增附件並提交」→ 填寫附件說明 → 在 DM 上傳檔案\n"
+            "   • 選「直接提交」→ 無附件直接送出\n\n"
+            "系統會將您的檢舉匿名轉交給管理員。"
+        ),
+        inline=False
+    )
+    
+    # 安全規則
+    embed.add_field(
+        name="� 核心互動規則",
+        value=(
+            "• 所有一對一輔導須透過平台申請，禁止私下約談\n"
+            "• 導師與學生不可私下透過非平台渠道聯繫\n"
+            "• 建議所有對談錄音或有第三者陪同以保障雙方權益\n"
+            "• 與未成年者互動需更加謹慎，禁止單獨私下見面\n"
+            "• 若發現違規行為，可使用 `/report` 進行檢舉"
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text="微光鎮感謝您的合作 | 如有問題請聯絡管理員")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 

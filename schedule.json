@@ -58,5 +58,27 @@
             "description": "test",
             "teacher": "羊羊"
         }
+    ],
+    "2025-11-02": [
+        {
+            "time": "02:00",
+            "title": "如何探討小姐姐什麼時候完成微光鎮",
+            "description": "注視她即可",
+            "teacher": "瀅心"
+        },
+        {
+            "time": "1:00",
+            "title": "fc",
+            "description": "fc",
+            "teacher": "羊羊"
+        }
+    ],
+    "2025-11-03": [
+        {
+            "time": "13:30",
+            "title": "觀摩小姐姐生態x2",
+            "description": "不用觀察，太可愛",
+            "teacher": "瀅心"
+        }
     ]
 }

@@ -435,7 +435,7 @@ async def on_ready():
 # 課表指令群組
 schedule_group = app_commands.Group(name="schedule", description="課表相關功能")
 
-@schedule_group.command(name="add", description="[教師用] 新增一堂課至課表")
+@schedule_group.command(name="add", description="新增一堂課至課表")
 @app_commands.describe(
     date="課程日期 (格式：YYYY-MM-DD)",
     time="課程時間 (格式：HH:MM)",
@@ -518,7 +518,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         for course in schedule[date]:
             embed.add_field(
                 name=f"⏰ {course['time']} - {course['title']}",
-                value=f"**授課者:** {course['teacher']}\n**內容:** {course['description']}",
+                value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                 inline=False
             )
     else:
@@ -526,7 +526,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         
     await interaction.response.send_message(embed=embed)
 
-@schedule_group.command(name="cancel", description="[教師用] 取消一堂課")
+@schedule_group.command(name="cancel", description="取消一堂課")
 @app_commands.describe(
     date="課程日期 (格式：YYYY-MM-DD)",
     time="課程時間 (格式：HH:MM)"

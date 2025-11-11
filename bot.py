@@ -37,6 +37,7 @@ load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
+TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
 SCHEDULE_FILE = "schedule.json"
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
@@ -65,7 +66,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 1. 一對一輔導申請表單 (Modal)
 class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
     topic = ui.TextInput(label="想請教的主題", style=discord.TextStyle.short, placeholder="例如：Python 函式庫使用", required=True)
-    tutor = ui.TextInput(label="希望的導師 (選填)", style=discord.TextStyle.short, placeholder="請輸入導師的 Discord ID 或留空", required=False)
+    tutor = ui.TextInput(label="希望的鎮民 (選填)", style=discord.TextStyle.short, placeholder="請輸入鎮民的 Discord ID 或留空", required=False)
     schedule = ui.TextInput(label="可配合的時段", style=discord.TextStyle.paragraph, placeholder="例如：平日晚上 8-10 點、週末下午", required=True)
     agreement = ui.TextInput(label="請輸入「同意」以接受錄音/陪同條款", style=discord.TextStyle.short, placeholder="同意", required=True)
 
@@ -90,19 +91,91 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
             color=discord.Color.blue()
         )
         embed.add_field(name="主題", value=self.topic.value, inline=False)
-        embed.add_field(name="偏好導師", value=self.tutor.value or "無指定", inline=False)
+        embed.add_field(name="偏好鎮民", value=self.tutor.value or "無指定", inline=False)
         embed.add_field(name="可配合時段", value=self.schedule.value, inline=False)
         embed.set_footer(text=f"申請人 ID: {interaction.user.id} | ⏰ 24 小時內回應")
 
         view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow())
         await request_channel.send(embed=embed, view=view)
-        await interaction.response.send_message("您的輔導申請已成功送出，請靜候導師回覆。", ephemeral=True)
+        await interaction.response.send_message("您的輔導申請已成功送出，請靜候回覆。", ephemeral=True)
         print(f"使用者 {interaction.user} 提交了輔導申請。")
+
+# 1a. 輔導頻道關閉按鈕 (View)
+class CloseTutoringChannelView(ui.View):
+    def __init__(self, tutor: discord.Member, applicant: discord.Member):
+        super().__init__(timeout=None)
+        self.tutor = tutor
+        self.applicant = applicant
+
+    @ui.button(label="🔒 關閉輔導", style=discord.ButtonStyle.danger, custom_id="close_tutoring_channel")
+    async def close_channel(self, interaction: discord.Interaction, button: ui.Button):
+        # 只允許導師或申請人關閉頻道
+        if interaction.user not in (self.tutor, self.applicant):
+            await interaction.response.send_message("❌ 只有申請人可以關閉此頻道。", ephemeral=True)
+            return
+
+        # 取得指定類別（輔導頻道專用）
+        channel = interaction.channel
+        guild = channel.guild
+        
+        tutoring_category = guild.get_channel(TUTORING_CATEGORY_ID)
+        
+        if tutoring_category is None or not isinstance(tutoring_category, discord.CategoryChannel):
+            await interaction.response.send_message("❌ 找不到輔導頻道類別，請聯絡管理員。", ephemeral=True)
+            return
+
+        # 將頻道移到指定類別（會自動加上「已關閉-」前綴以示區別）
+        old_name = channel.name
+        new_name = f"已關閉-{old_name}" if not old_name.startswith("已關閉-") else old_name
+        await channel.edit(category=tutoring_category, name=new_name)
+
+        # 鎖定頻道：禁止所有人（除管理員）傳送訊息
+        await channel.set_permissions(
+            guild.default_role,
+            read_messages=False,
+            send_messages=False
+        )
+        
+        # 保證申請人和導師只能查看但不能發言
+        await channel.set_permissions(
+            self.applicant,
+            read_messages=True,
+            send_messages=False
+        )
+        await channel.set_permissions(
+            self.tutor,
+            read_messages=True,
+            send_messages=False
+        )
+
+        # 允許管理員查看和發言
+        admin_role = discord.utils.find(lambda r: r.permissions.administrator, guild.roles)
+        if admin_role:
+            await channel.set_permissions(
+                admin_role,
+                read_messages=True,
+                send_messages=True
+            )
+
+        # 停用按鈕
+        self.clear_items()
+        await interaction.response.defer()
+        
+        # 發送通知訊息
+        embed = discord.Embed(
+            title="📋 輔導已結束",
+            description=f"此輔導頻道已於 {interaction.created_at.strftime('%Y-%m-%d %H:%M')} 關閉。\n"
+                        "頻道將保留作為存證記錄，僅管理員可以查看和編輯。",
+            color=discord.Color.greyple()
+        )
+        await channel.send(embed=embed, view=self)
+        print(f"輔導頻道 {channel.name} 已由 {interaction.user.name} 關閉並移至已關閉輔導資料夾。")
+
 
 # 1b. 輔導申請的按鈕 (View)
 class TutoringRequestView(ui.View):
     def __init__(self, applicant: discord.Member, created_at: datetime):
-        super().__init__(timeout=TUTORING_REQUEST_TIMEOUT)  # 24 小時逾時
+        super().__init__(timeout=None)  # 設為 None 讓 view 永久有效，時間檢查在 interaction_check 中進行
         self.applicant = applicant
         self.created_at = created_at
 
@@ -123,9 +196,16 @@ class TutoringRequestView(ui.View):
     @ui.button(label="✅ 接單", style=discord.ButtonStyle.success, custom_id="accept_tutoring")
     async def accept(self, interaction: discord.Interaction, button: ui.Button):
         tutor = interaction.user
-        category = interaction.channel.category
+        guild = interaction.guild
         
-        # 建立臨時私人頻道
+        # 取得指定類別（輔導頻道專用）
+        tutoring_category = guild.get_channel(TUTORING_CATEGORY_ID)
+        
+        if tutoring_category is None or not isinstance(tutoring_category, discord.CategoryChannel):
+            await interaction.response.send_message("❌ 找不到輔導頻道類別，請聯絡管理員。", ephemeral=True)
+            return
+        
+        # 建立臨時私人頻道（在指定類別中）
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
             self.applicant: discord.PermissionOverwrite(read_messages=True, send_messages=True),
@@ -133,7 +213,7 @@ class TutoringRequestView(ui.View):
             interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
         channel_name = f"輔導-{self.applicant.name}-{tutor.name}"
-        temp_channel = await interaction.guild.create_text_channel(channel_name, overwrites=overwrites, category=category)
+        temp_channel = await interaction.guild.create_text_channel(channel_name, overwrites=overwrites, category=tutoring_category)
 
         # 停用原始訊息的按鈕
         self.clear_items()
@@ -145,15 +225,17 @@ class TutoringRequestView(ui.View):
 
         # 通知雙方
         await interaction.response.send_message(f"您已接受 {self.applicant.mention} 的輔導申請。", ephemeral=True)
-        await self.applicant.send(f"好消息！您的輔導申請已被導師 {tutor.mention} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
+        await self.applicant.send(f"好消息！您的輔導申請已被 {tutor.mention} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
         
         # 4. 自動化記錄與提醒
+        close_view = CloseTutoringChannelView(tutor=tutor, applicant=self.applicant)
         await temp_channel.send(
-            f"歡迎 {self.applicant.mention} 與導師 {tutor.mention}！\n"
+            f"歡迎 {self.applicant.mention} 與 {tutor.mention}！\n"
             f"這裡是你們的專屬討論區。\n\n"
-            f"**給導師的提醒**：輔導結束後，請記得在此頻道簡要回報紀錄（例如：討論摘要、花費時間），以作為平台存證，感謝！"
+            f"**提醒**：輔導結束後，請記得在此頻道簡要回報紀錄（例如：討論摘要、花費時間），以作為平台存證，感謝！",
+            view=close_view
         )
-        print(f"導師 {tutor.name} 接受了 {self.applicant.name} 的申請，已建立頻道 {channel_name}。")
+        print(f" {tutor.name} 接受了 {self.applicant.name} 的申請，已建立頻道 {channel_name}。")
 
 
     @ui.button(label="❌ 婉拒", style=discord.ButtonStyle.danger, custom_id="decline_tutoring")
@@ -167,7 +249,7 @@ class TutoringRequestView(ui.View):
 
         await interaction.response.send_message(f"您已婉拒此申請。", ephemeral=True)
         await self.applicant.send(f"很遺憾，您的輔導申請已被婉拒。若有疑問請聯繫管理員。")
-        print(f"導師 {interaction.user.name} 婉拒了 {self.applicant.name} 的申請。")
+        print(f" {interaction.user.name} 婉拒了 {self.applicant.name} 的申請。")
 
 # 2. 匿名檢舉流程 (Slash Command)
 class ReportModal(ui.Modal):
@@ -542,10 +624,10 @@ async def rules(interaction: discord.Interaction):
         value=(
             "申請一對一線上輔導。執行後會彈出申請表，填寫內容包括：\n"
             "• 想請教的主題\n"
-            "• 希望的導師 (選填)\n"
+            "• 希望的鎮民 (選填)\n"
             "• 可配合的時段\n"
             "• 同意錄音/陪同條款\n\n"
-            "提交後導師可接單或婉拒，接單時會建立臨時私人討論頻道。"
+            "提交後鎮民可接單或婉拒，接單時會建立臨時私人討論頻道。"
         ),
         inline=False
     )
@@ -569,7 +651,7 @@ async def rules(interaction: discord.Interaction):
         name="� 核心互動規則",
         value=(
             "• 所有一對一輔導須透過平台申請，禁止私下約談\n"
-            "• 導師與學生不可私下透過非平台渠道聯繫\n"
+            "• 不可私下透過非平台渠道聯繫\n"
             "• 建議所有對談錄音或有第三者陪同以保障雙方權益\n"
             "• 與未成年者互動需更加謹慎，禁止單獨私下見面\n"
             "• 若發現違規行為，可使用 `/report` 進行檢舉"

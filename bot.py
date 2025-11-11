@@ -518,7 +518,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         for course in schedule[date]:
             embed.add_field(
                 name=f"⏰ {course['time']} - {course['title']}",
-                value=f"**授課老師:** {course['teacher']}\n**內容:** {course['description']}",
+                value=f"**授課者:** {course['teacher']}\n**內容:** {course['description']}",
                 inline=False
             )
     else:

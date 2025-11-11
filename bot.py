@@ -474,7 +474,7 @@ async def add_class(interaction: discord.Interaction, date: str, time: str, titl
     save_schedule(schedule)
     
     await interaction.response.send_message(f"✅ 課程 **{title}** 已成功新增至 **{date}** 的課表。", ephemeral=True)
-    print(f"教師 {interaction.user.display_name} 新增了課程：{date} {time} - {title}")
+    print(f"{interaction.user.display_name} 新增了課程：{date} {time} - {title}")
 
 @schedule_group.command(name="today", description="查詢今日課表")
 async def today_schedule(interaction: discord.Interaction):
@@ -490,7 +490,7 @@ async def today_schedule(interaction: discord.Interaction):
         for course in schedule[today_str]:
             embed.add_field(
                 name=f"⏰ {course['time']} - {course['title']}",
-                value=f"**授課老師:** {course['teacher']}\n**內容:** {course['description']}",
+                value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                 inline=False
             )
     else:
@@ -534,7 +534,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
 async def cancel_class(interaction: discord.Interaction, date: str, time: str):
     # 權限檢查
     if not any(role.name == '鎮民' for role in interaction.user.roles):
-        await interaction.response.send_message("抱歉，只有教師才能取消課程。", ephemeral=True)
+        await interaction.response.send_message("抱歉，只有開課者才能取消課程。", ephemeral=True)
         return
 
     try:
@@ -579,7 +579,7 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
         f"✅ 課程 **{course_to_cancel['title']}** (於 {date} {time}) 已成功取消。",
         ephemeral=True
     )
-    print(f"教師 {interaction.user.display_name} 取消了課程：{date} {time} - {course_to_cancel['title']}")
+    print(f"{interaction.user.display_name} 取消了課程：{date} {time} - {course_to_cancel['title']}")
 
 bot.tree.add_command(schedule_group)
 
@@ -604,7 +604,7 @@ async def rules(interaction: discord.Interaction):
     
     # 課表相關指令
     embed.add_field(
-        name="� 課表指令群組 (`/schedule`)",
+        name="課表指令群組 (`/schedule`)",
         value=(
             "• **`/schedule add`**\n"
             "  新增一堂課至課表。需要提供課程日期 (YYYY-MM-DD)、時間 (HH:MM)、標題、描述。\n\n"
@@ -648,7 +648,7 @@ async def rules(interaction: discord.Interaction):
     
     # 安全規則
     embed.add_field(
-        name="� 核心互動規則",
+        name="核心互動規則",
         value=(
             "• 所有一對一輔導須透過平台申請，禁止私下約談\n"
             "• 不可私下透過非平台渠道聯繫\n"

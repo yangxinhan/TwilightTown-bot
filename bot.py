@@ -85,20 +85,50 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
             await interaction.response.send_message("錯誤：找不到輔導申請頻道，請聯絡管理員。", ephemeral=True)
             return
 
+        # 嘗試解析偏好鎮民 (可輸入昵稱或 Discord ID)
+        preferred_tutor = None
+        tutor_display_text = self.tutor.value or "無指定"
+        if self.tutor.value.strip():
+            guild = interaction.guild
+            # 嘗試用 ID 查詢
+            try:
+                tutor_id = int(self.tutor.value.strip())
+                preferred_tutor = guild.get_member(tutor_id)
+            except (ValueError, AttributeError):
+                pass
+            
+            # 若 ID 查詢失敗，嘗試用昵稱查詢
+            if not preferred_tutor:
+                preferred_tutor = discord.utils.find(
+                    lambda m: m.display_name.lower() == self.tutor.value.strip().lower() or m.name.lower() == self.tutor.value.strip().lower(),
+                    guild.members
+                )
+            
+            # 若找到該鎮民，更新 display_text 為 mention
+            if preferred_tutor:
+                tutor_display_text = preferred_tutor.mention
+            else:
+                tutor_display_text = self.tutor.value + " (找不到此使用者)"
+
         embed = discord.Embed(
             title="新的輔導申請",
             description=f"申請人：{interaction.user.mention}",
             color=discord.Color.blue()
         )
         embed.add_field(name="主題", value=self.topic.value, inline=False)
-        embed.add_field(name="偏好鎮民", value=self.tutor.value or "無指定", inline=False)
+        embed.add_field(name="偏好鎮民", value=tutor_display_text, inline=False)
         embed.add_field(name="可配合時段", value=self.schedule.value, inline=False)
         embed.set_footer(text=f"申請人 ID: {interaction.user.id} | ⏰ 24 小時內回應")
 
-        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow())
+        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow(), preferred_tutor=preferred_tutor)
         await request_channel.send(embed=embed, view=view)
+        
+        # 若有指定偏好鎮民，發送一條 tag 訊息
+        if preferred_tutor:
+            await request_channel.send(f"📢 {preferred_tutor.mention}，有一則輔導申請指定了您！")
+        
         await interaction.response.send_message("您的輔導申請已成功送出，請靜候回覆。", ephemeral=True)
-        print(f"使用者 {interaction.user} 提交了輔導申請。")
+        print(f"使用者 {interaction.user} 提交了輔導申請，偏好鎮民：{preferred_tutor if preferred_tutor else '無指定'}。")
 
 # 1a. 輔導頻道關閉按鈕 (View)
 class CloseTutoringChannelView(ui.View):
@@ -109,6 +139,11 @@ class CloseTutoringChannelView(ui.View):
 
     @ui.button(label="🔒 關閉輔導", style=discord.ButtonStyle.danger, custom_id="close_tutoring_channel")
     async def close_channel(self, interaction: discord.Interaction, button: ui.Button):
+        # 若 tutor 或 applicant 為 None，表示是機器人啟動時的佔位符，直接返回
+        if self.tutor is None or self.applicant is None:
+            await interaction.response.send_message("❌ 此按鈕已過期，請聯絡管理員。", ephemeral=True)
+            return
+        
         # 只允許導師或申請人關閉頻道
         if interaction.user not in (self.tutor, self.applicant):
             await interaction.response.send_message("❌ 只有申請人可以關閉此頻道。", ephemeral=True)
@@ -174,13 +209,18 @@ class CloseTutoringChannelView(ui.View):
 
 # 1b. 輔導申請的按鈕 (View)
 class TutoringRequestView(ui.View):
-    def __init__(self, applicant: discord.Member, created_at: datetime):
+    def __init__(self, applicant: discord.Member, created_at: datetime, preferred_tutor: Optional[discord.Member] = None):
         super().__init__(timeout=None)  # 設為 None 讓 view 永久有效，時間檢查在 interaction_check 中進行
         self.applicant = applicant
         self.created_at = created_at
+        self.preferred_tutor = preferred_tutor  # 新增：偏好導師
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """檢查時間限制與按鈕權限"""
+        # 若 applicant 為 None（機器人剛啟動時的佔位符），允許交互通過
+        if self.applicant is None:
+            return True
+        
         # 檢查是否超過 24 小時
         if datetime.utcnow() - self.created_at > timedelta(seconds=TUTORING_REQUEST_TIMEOUT):
             await interaction.response.send_message(
@@ -189,12 +229,24 @@ class TutoringRequestView(ui.View):
             )
             return False
 
-        # 檢查按鈕權限：只有指定的導師或無指定時任何導師都可操作
-        # 這裡使用簡單邏輯，實際可根據申請時的偏好導師進行檢查
+        # 檢查按鈕權限：如果指定了偏好導師，只有該導師可操作；否則任何導師都可
+        if self.preferred_tutor:
+            if interaction.user != self.preferred_tutor:
+                await interaction.response.send_message(
+                    f"❌ 只有 {self.preferred_tutor.mention} 可以接受或婉拒此申請。",
+                    ephemeral=True
+                )
+                return False
+        
         return True
 
     @ui.button(label="✅ 接單", style=discord.ButtonStyle.success, custom_id="accept_tutoring")
     async def accept(self, interaction: discord.Interaction, button: ui.Button):
+        # 若 applicant 為 None，表示是機器人啟動時的佔位符
+        if self.applicant is None:
+            await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
+            return
+        
         tutor = interaction.user
         guild = interaction.guild
         
@@ -240,6 +292,11 @@ class TutoringRequestView(ui.View):
 
     @ui.button(label="❌ 婉拒", style=discord.ButtonStyle.danger, custom_id="decline_tutoring")
     async def decline(self, interaction: discord.Interaction, button: ui.Button):
+        # 若 applicant 為 None，表示是機器人啟動時的佔位符
+        if self.applicant is None:
+            await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
+            return
+        
         self.clear_items()
         original_message = interaction.message
         edited_embed = original_message.embeds[0]
@@ -420,8 +477,9 @@ async def dispatch_anonymous_report(
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
-    # 如果View是設計成永久有效的，需要這段來重載
-    bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow()))
+    # 重新註冊 view 以支援機器人重啟後的舊按鈕交互
+    bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow(), preferred_tutor=None))
+    bot.add_view(CloseTutoringChannelView(tutor=None, applicant=None))
     print(f'Bot is ready to use.')
     try:
         synced = await bot.tree.sync()

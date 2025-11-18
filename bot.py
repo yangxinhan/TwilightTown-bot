@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 import json
 from datetime import datetime, timedelta
 from typing import Optional, List
+import mysql.connector
+from mysql.connector import Error
 
 # 檢舉文件確認按鈕 View
 class ConfirmReportView(ui.View):
@@ -38,22 +40,130 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
 TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
-SCHEDULE_FILE = "schedule.json"
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
-# --- 課表資料處理 ---
-def load_schedule():
-    """從 JSON 檔案載入課表資料"""
+# MariaDB 連接設定
+DB_CONFIG = {
+    'host': os.getenv("DB_HOST", "100.106.250.36"),
+    'user': os.getenv("DB_USER", "admin"),
+    'password': os.getenv("DB_PASSWORD", "960404"),
+    'database': os.getenv("DB_NAME", "mydb"),
+    'charset': 'utf8mb4',
+    'use_unicode': True
+}
+
+# --- 資料庫連接函數 ---
+def get_db_connection():
+    """建立並返回資料庫連接"""
     try:
-        with open(SCHEDULE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        connection = mysql.connector.connect(**DB_CONFIG)
+        return connection
+    except Error as e:
+        print(f"❌ 資料庫連接失敗: {e}")
+        return None
+
+# --- 課表資料處理（改用 MariaDB）---
+def load_schedule():
+    """從 MariaDB 載入課表資料"""
+    connection = get_db_connection()
+    if not connection:
         return {}
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT date, time, title, description, teacher 
+            FROM schedule 
+            ORDER BY date, time
+        """)
+        
+        rows = cursor.fetchall()
+        schedule = {}
+        
+        for row in rows:
+            date_str = row['date'].strftime("%Y-%m-%d") if hasattr(row['date'], 'strftime') else str(row['date'])
+            
+            if date_str not in schedule:
+                schedule[date_str] = []
+            
+            schedule[date_str].append({
+                'time': row['time'] if isinstance(row['time'], str) else row['time'].strftime("%H:%M"),
+                'title': row['title'],
+                'description': row['description'],
+                'teacher': row['teacher']
+            })
+        
+        cursor.close()
+        return schedule
+        
+    except Error as e:
+        print(f"❌ 讀取課表失敗: {e}")
+        return {}
+    finally:
+        connection.close()
 
 def save_schedule(data):
-    """將課表資料儲存到 JSON 檔案"""
-    with open(SCHEDULE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    """將課表資料儲存到 MariaDB（新增或更新）"""
+    connection = get_db_connection()
+    if not connection:
+        print("❌ 無法連接資料庫")
+        return False
+    
+    try:
+        cursor = connection.cursor()
+        
+        for date_str, courses in data.items():
+            for course in courses:
+                # 檢查該課程是否已存在
+                check_query = """
+                    SELECT id FROM schedule 
+                    WHERE date = %s AND time = %s AND teacher = %s AND title = %s
+                """
+                cursor.execute(check_query, (
+                    date_str,
+                    course['time'],
+                    course.get('teacher', ''),
+                    course['title']
+                ))
+                
+                if cursor.fetchone():
+                    # 更新現有課程
+                    update_query = """
+                        UPDATE schedule 
+                        SET description = %s
+                        WHERE date = %s AND time = %s AND teacher = %s AND title = %s
+                    """
+                    cursor.execute(update_query, (
+                        course.get('description', ''),
+                        date_str,
+                        course['time'],
+                        course.get('teacher', ''),
+                        course['title']
+                    ))
+                else:
+                    # 插入新課程
+                    insert_query = """
+                        INSERT INTO schedule (date, time, title, description, teacher)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(insert_query, (
+                        date_str,
+                        course['time'],
+                        course['title'],
+                        course.get('description', ''),
+                        course.get('teacher', '')
+                    ))
+        
+        connection.commit()
+        cursor.close()
+        return True
+        
+    except Error as e:
+        print(f"❌ 儲存課表失敗: {e}")
+        connection.rollback()
+        return False
+    finally:
+        connection.close()
 
 # --- Bot 設定 ---
 intents = discord.Intents.default()

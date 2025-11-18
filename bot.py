@@ -734,6 +734,36 @@ async def on_ready():
     bot.add_view(CloseTutoringChannelView(tutor=None, applicant=None))
     bot.add_view(TagPreferenceView())  # 註冊 Tag 偏好視圖
     print(f'Bot is ready to use.')
+    
+    # 在 Bot 首次啟動時發送 Tag 偏好設置消息
+    try:
+        tag_channel = bot.get_channel(TAG_PREFERENCE_CHANNEL_ID)
+        if tag_channel:
+            # 檢查頻道中是否已有機器人發送的消息
+            try:
+                async for message in tag_channel.history(limit=10):
+                    if message.author == bot.user and "機器人 Tag 偏好設置" in message.embeds[0].title if message.embeds else False:
+                        print(f"✅ Tag 偏好設置消息已存在於 {tag_channel.name}，跳過重複發送。")
+                        break
+                else:
+                    # 沒有找到既有消息，發送新消息
+                    embed = discord.Embed(
+                        title="🎯 機器人 Tag 偏好設置",
+                        description="請選擇您是否願意被本機器人 Tag。\n\n"
+                                    "✅ **接受 Tag**：機器人可以在任何場合提及您。\n"
+                                    "❌ **拒絕 Tag**：機器人不會提及您。\n\n"
+                                    "**默認狀態**：若您未做選擇，將視為可以被 Tag。",
+                        color=discord.Color.blue()
+                    )
+                    embed.set_footer(text="您的選擇將被記錄在系統中")
+                    view = TagPreferenceView()
+                    await tag_channel.send(embed=embed, view=view)
+                    print(f"✅ Tag 偏好設置消息已發送到 {tag_channel.name}")
+            except Exception as e:
+                print(f"⚠️ 檢查 Tag 偏好消息時出錯: {e}")
+    except Exception as e:
+        print(f"⚠️ 無法訪問 Tag 偏好頻道: {e}")
+    
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")

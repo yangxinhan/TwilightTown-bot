@@ -9,6 +9,101 @@ from typing import Optional, List
 import mysql.connector
 from mysql.connector import Error
 
+# Tag 同意度確認按鈕 View
+class TagPreferenceView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # 永久有效
+
+    @ui.button(label="✅ 接受 Tag", style=discord.ButtonStyle.success, custom_id="accept_tag")
+    async def accept_tag(self, interaction: discord.Interaction, button: ui.Button):
+        """使用者接受 Tag"""
+        user_id = interaction.user.id
+        connection = get_db_connection()
+        if not connection:
+            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+            return
+
+        try:
+            cursor = connection.cursor()
+            
+            # 檢查該使用者是否已有紀錄
+            cursor.execute("SELECT id FROM user_tag_preferences WHERE user_id = %s", (user_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # 更新現有紀錄
+                cursor.execute("""
+                    UPDATE user_tag_preferences 
+                    SET tag_accepted = TRUE, updated_at = NOW()
+                    WHERE user_id = %s
+                """, (user_id,))
+            else:
+                # 插入新紀錄
+                cursor.execute("""
+                    INSERT INTO user_tag_preferences (user_id, tag_accepted, created_at, updated_at)
+                    VALUES (%s, TRUE, NOW(), NOW())
+                """, (user_id,))
+            
+            connection.commit()
+            await interaction.response.send_message(
+                "✅ 感謝！您已同意接受 Tag。",
+                ephemeral=True
+            )
+            print(f"使用者 {interaction.user.name} (ID: {user_id}) 已接受 Tag。")
+            
+        except Error as e:
+            print(f"❌ 設定 Tag 偏好失敗: {e}")
+            await interaction.response.send_message("❌ 設定失敗，請稍後重試。", ephemeral=True)
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
+
+    @ui.button(label="❌ 拒絕 Tag", style=discord.ButtonStyle.danger, custom_id="decline_tag")
+    async def decline_tag(self, interaction: discord.Interaction, button: ui.Button):
+        """使用者拒絕 Tag"""
+        user_id = interaction.user.id
+        connection = get_db_connection()
+        if not connection:
+            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+            return
+
+        try:
+            cursor = connection.cursor()
+            
+            # 檢查該使用者是否已有紀錄
+            cursor.execute("SELECT id FROM user_tag_preferences WHERE user_id = %s", (user_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # 更新現有紀錄
+                cursor.execute("""
+                    UPDATE user_tag_preferences 
+                    SET tag_accepted = FALSE, updated_at = NOW()
+                    WHERE user_id = %s
+                """, (user_id,))
+            else:
+                # 插入新紀錄
+                cursor.execute("""
+                    INSERT INTO user_tag_preferences (user_id, tag_accepted, created_at, updated_at)
+                    VALUES (%s, FALSE, NOW(), NOW())
+                """, (user_id,))
+            
+            connection.commit()
+            await interaction.response.send_message(
+                "❌ 已記錄。您的 Tag 將被設為不接受。",
+                ephemeral=True
+            )
+            print(f"使用者 {interaction.user.name} (ID: {user_id}) 已拒絕 Tag。")
+            
+        except Error as e:
+            print(f"❌ 設定 Tag 偏好失敗: {e}")
+            await interaction.response.send_message("❌ 設定失敗，請稍後重試。", ephemeral=True)
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
+
 # 檢舉文件確認按鈕 View
 class ConfirmReportView(ui.View):
     def __init__(self, report_data: dict):
@@ -40,6 +135,7 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
 TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
+TAG_PREFERENCE_CHANNEL_ID = int(os.getenv("TAG_PREFERENCE_CHANNEL_ID", "1440166958904639599"))  # Tag偏好頻道ID
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
 # MariaDB 連接設定
@@ -61,6 +157,40 @@ def get_db_connection():
     except Error as e:
         print(f"❌ 資料庫連接失敗: {e}")
         return None
+
+# --- Tag 偏好檢查函數 ---
+def can_tag_user(user_id: int) -> bool:
+    """
+    檢查使用者是否可被 Tag
+    - True: 可以 Tag（使用者接受或沒有設定過）
+    - False: 不可以 Tag（使用者明確拒絕）
+    """
+    connection = get_db_connection()
+    if not connection:
+        return True  # 若無法連接資料庫，預設允許 Tag（保險起見）
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT tag_accepted FROM user_tag_preferences 
+            WHERE user_id = %s
+        """, (user_id,))
+        
+        result = cursor.fetchone()
+        cursor.close()
+        
+        if result is None:
+            # 沒有設定過，視為可以 Tag
+            return True
+        else:
+            # 返回使用者設定的偏好
+            return result['tag_accepted']
+    
+    except Error as e:
+        print(f"❌ 檢查 Tag 偏好失敗: {e}")
+        return True  # 出錯時預設允許 Tag
+    finally:
+        connection.close()
 
 # --- 課表資料處理（改用 MariaDB）---
 def load_schedule():
@@ -602,6 +732,7 @@ async def on_ready():
     # 重新註冊 view 以支援機器人重啟後的舊按鈕交互
     bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow(), preferred_tutor=None))
     bot.add_view(CloseTutoringChannelView(tutor=None, applicant=None))
+    bot.add_view(TagPreferenceView())  # 註冊 Tag 偏好視圖
     print(f'Bot is ready to use.')
     try:
         synced = await bot.tree.sync()
@@ -883,6 +1014,55 @@ async def rules(interaction: discord.Interaction):
     embed.set_footer(text="微光鎮感謝您的合作 | 如有問題請聯絡管理員")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# 4. Tag 偏好設置指令（管理員用）
+@bot.tree.command(name="setup-tag-preference", description="[管理員] 在指定頻道放置 Tag 偏好設置消息")
+@app_commands.default_permissions(administrator=True)
+async def setup_tag_preference(interaction: discord.Interaction):
+    """在 TAG_PREFERENCE_CHANNEL_ID 頻道中放置 Tag 偏好設置消息"""
+    
+    # 驗證是否為管理員
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 只有管理員可以執行此指令。", ephemeral=True)
+        return
+    
+    try:
+        # 取得目標頻道
+        target_channel = bot.get_channel(TAG_PREFERENCE_CHANNEL_ID)
+        if not target_channel:
+            await interaction.response.send_message(
+                f"❌ 找不到 ID 為 {TAG_PREFERENCE_CHANNEL_ID} 的頻道。請檢查 TAG_PREFERENCE_CHANNEL_ID 設定。",
+                ephemeral=True
+            )
+            return
+        
+        # 建立 Embed 消息
+        embed = discord.Embed(
+            title="🎯 機器人 Tag 偏好設置",
+            description="請選擇您是否願意被本機器人 Tag。\n\n"
+                        "✅ **接受 Tag**：機器人可以在任何場合提及您。\n"
+                        "❌ **拒絕 Tag**：機器人不會提及您。\n\n"
+                        "**默認狀態**：若您未做選擇，將視為可以被 Tag。",
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="您的選擇將被記錄在系統中")
+        
+        # 發送消息和按鈕
+        view = TagPreferenceView()
+        await target_channel.send(embed=embed, view=view)
+        
+        await interaction.response.send_message(
+            f"✅ Tag 偏好設置消息已成功放置在 {target_channel.mention}。",
+            ephemeral=True
+        )
+        print(f"管理員 {interaction.user.name} 在頻道 {target_channel.name} 放置了 Tag 偏好設置消息。")
+        
+    except Exception as e:
+        print(f"❌ 放置 Tag 偏好設置消息失敗: {e}")
+        await interaction.response.send_message(
+            f"❌ 操作失敗：{str(e)}",
+            ephemeral=True
+        )
 
 # --- 啟動 Bot ---
 bot.run(DISCORD_BOT_TOKEN)

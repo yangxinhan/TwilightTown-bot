@@ -81,13 +81,25 @@ def load_schedule():
         schedule = {}
         
         for row in rows:
-            date_str = row['date'].strftime("%Y-%m-%d") if hasattr(row['date'], 'strftime') else str(row['date'])
+            # 處理日期格式
+            if hasattr(row['date'], 'strftime'):
+                date_str = row['date'].strftime("%Y-%m-%d")
+            else:
+                date_str = str(row['date'])
             
             if date_str not in schedule:
                 schedule[date_str] = []
             
+            # 處理時間格式（從資料庫 HH:MM:SS 轉為 HH:MM）
+            if isinstance(row['time'], str):
+                time_str = row['time'][:5]  # 取前 5 個字符 HH:MM
+            elif hasattr(row['time'], 'strftime'):
+                time_str = row['time'].strftime("%H:%M")
+            else:
+                time_str = str(row['time'])[:5]
+            
             schedule[date_str].append({
-                'time': row['time'] if isinstance(row['time'], str) else row['time'].strftime("%H:%M"),
+                'time': time_str,
                 'title': row['title'],
                 'description': row['description'],
                 'teacher': row['teacher']

@@ -192,6 +192,17 @@ def can_tag_user(user_id: int) -> bool:
     finally:
         connection.close()
 
+def get_user_mention(user: discord.Member) -> str:
+    """
+    根據使用者的 Tag 偏好，返回 mention 或文本名稱
+    - 如果允許 Tag，返回 mention (@user)
+    - 如果禁止 Tag，返回文本名稱 (@user_name)
+    """
+    if can_tag_user(user.id):
+        return user.mention  # 返回 mention
+    else:
+        return f"@{user.display_name}"  # 返回文本名稱
+
 # --- 課表資料處理（改用 MariaDB）---
 def load_schedule():
     """從 MariaDB 載入課表資料"""
@@ -358,13 +369,13 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
             
             # 若找到該鎮民，更新 display_text 為 mention
             if preferred_tutor:
-                tutor_display_text = preferred_tutor.mention
+                tutor_display_text = get_user_mention(preferred_tutor)
             else:
                 tutor_display_text = self.tutor.value + " (找不到此使用者)"
 
         embed = discord.Embed(
             title="新的輔導申請",
-            description=f"申請人：{interaction.user.mention}",
+            description=f"申請人：{get_user_mention(interaction.user)}",
             color=discord.Color.blue()
         )
         embed.add_field(name="主題", value=self.topic.value, inline=False)
@@ -377,7 +388,7 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
         
         # 若有指定偏好鎮民，發送一條 tag 訊息
         if preferred_tutor:
-            await request_channel.send(f"📢 {preferred_tutor.mention}，有一則輔導申請指定了您！")
+            await request_channel.send(f"📢 {get_user_mention(preferred_tutor)}，有一則輔導申請指定了您！")
         
         await interaction.response.send_message("您的輔導申請已成功送出，請靜候回覆。", ephemeral=True)
         print(f"使用者 {interaction.user} 提交了輔導申請，偏好鎮民：{preferred_tutor if preferred_tutor else '無指定'}。")
@@ -485,7 +496,7 @@ class TutoringRequestView(ui.View):
         if self.preferred_tutor:
             if interaction.user != self.preferred_tutor:
                 await interaction.response.send_message(
-                    f"❌ 只有 {self.preferred_tutor.mention} 可以接受或婉拒此申請。",
+                    f"❌ 只有 {get_user_mention(self.preferred_tutor)} 可以接受或婉拒此申請。",
                     ephemeral=True
                 )
                 return False
@@ -523,18 +534,18 @@ class TutoringRequestView(ui.View):
         self.clear_items()
         original_message = interaction.message
         edited_embed = original_message.embeds[0]
-        edited_embed.description = f"申請人：{self.applicant.mention}\n**由 {tutor.mention} 已接單**"
+        edited_embed.description = f"申請人：{get_user_mention(self.applicant)}\n**由 {get_user_mention(tutor)} 已接單**"
         edited_embed.color = discord.Color.green()
         await original_message.edit(embed=edited_embed, view=self)
 
         # 通知雙方
-        await interaction.response.send_message(f"您已接受 {self.applicant.mention} 的輔導申請。", ephemeral=True)
-        await self.applicant.send(f"好消息！您的輔導申請已被 {tutor.mention} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
+        await interaction.response.send_message(f"您已接受 {get_user_mention(self.applicant)} 的輔導申請。", ephemeral=True)
+        await self.applicant.send(f"好消息！您的輔導申請已被 {get_user_mention(tutor)} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
         
         # 4. 自動化記錄與提醒
         close_view = CloseTutoringChannelView(tutor=tutor, applicant=self.applicant)
         await temp_channel.send(
-            f"歡迎 {self.applicant.mention} 與 {tutor.mention}！\n"
+            f"歡迎 {get_user_mention(self.applicant)} 與 {get_user_mention(tutor)}！\n"
             f"這裡是你們的專屬討論區。\n\n"
             f"**提醒**：輔導結束後，請記得在此頻道簡要回報紀錄（例如：討論摘要、花費時間），以作為平台存證，感謝！",
             view=close_view
@@ -552,7 +563,7 @@ class TutoringRequestView(ui.View):
         self.clear_items()
         original_message = interaction.message
         edited_embed = original_message.embeds[0]
-        edited_embed.description = f"申請人：{self.applicant.mention}\n**由 {interaction.user.mention} 已婉拒**"
+        edited_embed.description = f"申請人：{get_user_mention(self.applicant)}\n**由 {get_user_mention(interaction.user)} 已婉拒**"
         edited_embed.color = discord.Color.red()
         await original_message.edit(embed=edited_embed, view=self)
 

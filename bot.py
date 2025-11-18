@@ -623,10 +623,9 @@ schedule_group = app_commands.Group(name="schedule", description="課表相關�
     description="課程內容的詳細說明"
 )
 async def add_class(interaction: discord.Interaction, date: str, time: str, title: str, description: str):
-    # 簡易的權限檢查，只允許有 "老師" 角色的使用者操作
-    # 在您的伺服器中，請確保教師們都有一個名為 "老師" 的角色
+    # 簡易的權限檢查，只允許有 "鎮民" 角色的使用者操作
     if not any(role.name == '鎮民' for role in interaction.user.roles):
-        await interaction.response.send_message("抱歉，只有教師才能新增課程。", ephemeral=True)
+        await interaction.response.send_message("抱歉，只有鎮民才能新增課程。", ephemeral=True)
         return
 
     try:
@@ -637,24 +636,47 @@ async def add_class(interaction: discord.Interaction, date: str, time: str, titl
         await interaction.response.send_message("日期或時間格式錯誤！請使用 `YYYY-MM-DD` 和 `HH:MM` 格式。", ephemeral=True)
         return
 
-    schedule = load_schedule()
-    if date not in schedule:
-        schedule[date] = []
+    # 直接插入到 MariaDB
+    connection = get_db_connection()
+    if not connection:
+        await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+        return
 
-    schedule[date].append({
-        "time": time,
-        "title": title,
-        "description": description,
-        "teacher": interaction.user.display_name
-    })
-    
-    # 排序當天的課程
-    schedule[date].sort(key=lambda x: x['time'])
-    
-    save_schedule(schedule)
-    
-    await interaction.response.send_message(f"✅ 課程 **{title}** 已成功新增至 **{date}** 的課表。", ephemeral=True)
-    print(f"{interaction.user.display_name} 新增了課程：{date} {time} - {title}")
+    try:
+        cursor = connection.cursor()
+        
+        # 檢查是否已存在相同的課程
+        check_query = """
+            SELECT id FROM schedule 
+            WHERE date = %s AND time = %s AND title = %s AND teacher = %s
+        """
+        cursor.execute(check_query, (date, time, title, interaction.user.display_name))
+        
+        if cursor.fetchone():
+            await interaction.response.send_message("❌ 此課程已存在，請勿重複新增。", ephemeral=True)
+            cursor.close()
+            connection.close()
+            return
+        
+        # 插入新課程
+        insert_query = """
+            INSERT INTO schedule (date, time, title, description, teacher)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (date, time, title, description, interaction.user.display_name))
+        connection.commit()
+        
+        await interaction.response.send_message(f"✅ 課程 **{title}** 已成功新增至 **{date}** {time} 的課表。", ephemeral=True)
+        print(f"{interaction.user.display_name} 新增了課程：{date} {time} - {title}")
+        
+        cursor.close()
+        
+    except Error as e:
+        print(f"❌ 新增課程失敗: {e}")
+        await interaction.response.send_message(f"❌ 新增課程失敗：{str(e)}", ephemeral=True)
+        connection.rollback()
+    finally:
+        connection.close()
 
 @schedule_group.command(name="today", description="查詢今日課表")
 async def today_schedule(interaction: discord.Interaction):
@@ -714,7 +736,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
 async def cancel_class(interaction: discord.Interaction, date: str, time: str):
     # 權限檢查
     if not any(role.name == '鎮民' for role in interaction.user.roles):
-        await interaction.response.send_message("抱歉，只有開課者才能取消課程。", ephemeral=True)
+        await interaction.response.send_message("抱歉，只有鎮民才能取消課程。", ephemeral=True)
         return
 
     try:
@@ -724,42 +746,61 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
         await interaction.response.send_message("日期或時間格式錯誤！請使用 `YYYY-MM-DD` 和 `HH:MM` 格式。", ephemeral=True)
         return
 
-    schedule = load_schedule()
-    
-    if date not in schedule or not schedule[date]:
-        await interaction.response.send_message(f"❌ 在 {date} 沒有任何課程。", ephemeral=True)
+    # 從 MariaDB 直接刪除課程
+    connection = get_db_connection()
+    if not connection:
+        await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
         return
 
-    # 尋找要取消的課程
-    course_to_cancel = None
-    for course in schedule[date]:
-        if course['time'] == time:
-            course_to_cancel = course
-            break
-
-    if course_to_cancel is None:
-        await interaction.response.send_message(f"❌ 在 {date} {time} 沒有找到課程。", ephemeral=True)
-        return
-
-    # 檢查是否為本人的課程
-    if course_to_cancel['teacher'] != interaction.user.display_name:
-        await interaction.response.send_message("❌ 您只能取消自己的課程。", ephemeral=True)
-        return
-
-    # 移除課程
-    schedule[date].remove(course_to_cancel)
-    
-    # 若該日期已無課程，刪除該日期
-    if not schedule[date]:
-        del schedule[date]
-
-    save_schedule(schedule)
-
-    await interaction.response.send_message(
-        f"✅ 課程 **{course_to_cancel['title']}** (於 {date} {time}) 已成功取消。",
-        ephemeral=True
-    )
-    print(f"{interaction.user.display_name} 取消了課程：{date} {time} - {course_to_cancel['title']}")
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 先查詢課程是否存在，並確認是本人的課程
+        select_query = """
+            SELECT id, title FROM schedule 
+            WHERE date = %s AND time = %s AND teacher = %s
+        """
+        cursor.execute(select_query, (date, time, interaction.user.display_name))
+        course = cursor.fetchone()
+        
+        if not course:
+            # 沒找到或不是本人的課程
+            cursor.execute("""
+                SELECT title FROM schedule 
+                WHERE date = %s AND time = %s
+            """, (date, time))
+            
+            if cursor.fetchone():
+                await interaction.response.send_message("❌ 您只能取消自己的課程。", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ 在 {date} {time} 沒有找到課程。", ephemeral=True)
+            
+            cursor.close()
+            connection.close()
+            return
+        
+        # 刪除課程
+        delete_query = """
+            DELETE FROM schedule 
+            WHERE date = %s AND time = %s AND teacher = %s
+        """
+        cursor.execute(delete_query, (date, time, interaction.user.display_name))
+        connection.commit()
+        
+        await interaction.response.send_message(
+            f"✅ 課程 **{course['title']}** (於 {date} {time}) 已成功取消。",
+            ephemeral=True
+        )
+        print(f"{interaction.user.display_name} 取消了課程：{date} {time} - {course['title']}")
+        
+        cursor.close()
+        
+    except Error as e:
+        print(f"❌ 取消課程失敗: {e}")
+        await interaction.response.send_message(f"❌ 取消課程失敗：{str(e)}", ephemeral=True)
+        connection.rollback()
+    finally:
+        connection.close()
 
 bot.tree.add_command(schedule_group)
 

@@ -822,7 +822,7 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
         # 檢查是否已存在相同的課程
         check_query = """
             SELECT id FROM schedule 
-            WHERE date = %s AND stime = %s AND title = %s AND teacher = %s
+            WHERE date = %s AND stime = %s AND etime = %s AND title = %s AND teacher = %s
         """
         cursor.execute(check_query, (date, stime, etime, title, interaction.user.display_name))
         

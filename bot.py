@@ -882,11 +882,16 @@ async def today_schedule(interaction: discord.Interaction):
         if rows:
             for course in rows:
                 # 處理時間格式
-                stime = str(course['stime'])[:5]
-                etime = str(course['etime'])[:5]
+                stime = str(course['stime'])
+                if stime.count(':') >= 2:
+                    stime = stime.rsplit(':', 1)[0]
+                
+                etime = str(course['etime'])
+                if etime.count(':') >= 2:
+                    etime = etime.rsplit(':', 1)[0]
                 
                 embed.add_field(
-                    name=f"⏰ {stime} - {etime} - {course['title']}",
+                    name=f"⏰ {stime}~{etime} {course['title']}",
                     value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                     inline=False
                 )
@@ -935,11 +940,16 @@ async def view_schedule(interaction: discord.Interaction, date: str):
 
         if rows:
             for course in rows:
-                stime = str(course['stime'])[:5]
-                etime = str(course['etime'])[:5]
+                stime = str(course['stime'])
+                if stime.count(':') >= 2:
+                    stime = stime.rsplit(':', 1)[0]
+                
+                etime = str(course['etime'])
+                if etime.count(':') >= 2:
+                    etime = etime.rsplit(':', 1)[0]
                 
                 embed.add_field(
-                    name=f"⏰ {stime} - {etime} - {course['title']}",
+                    name=f"⏰ {stime}~{etime} {course['title']}",
                     value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                     inline=False
                 )

@@ -834,8 +834,8 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
         
         # 插入新課程
         insert_query = """
-            INSERT INTO schedule (date, time, title, description, teacher)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO schedule (date, stime, etime, title, description, teacher)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """
         cursor.execute(insert_query, (date, stime, etime, title, description, interaction.user.display_name))
         connection.commit()
@@ -865,7 +865,7 @@ async def today_schedule(interaction: discord.Interaction):
     if today_str in schedule and schedule[today_str]:
         for course in schedule[today_str]:
             embed.add_field(
-                name=f"⏰ {course['time']} - {course['title']}",
+                name=f"⏰ {course['stime']} - {course['etime']} - {course['title']}",
                 value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                 inline=False
             )
@@ -893,7 +893,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
     if date in schedule and schedule[date]:
         for course in schedule[date]:
             embed.add_field(
-                name=f"⏰ {course['time']} - {course['title']}",
+                name=f"⏰ {course['stime']} - {course['etime']} - {course['title']}",
                 value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
                 inline=False
             )

@@ -4,7 +4,7 @@ from discord import app_commands, ui
 import os
 from dotenv import load_dotenv
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 import mysql.connector
 from mysql.connector import Error
@@ -854,25 +854,54 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
 
 @schedule_group.command(name="today", description="查詢今日課表")
 async def today_schedule(interaction: discord.Interaction):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    schedule = load_schedule()
+    # 使用 UTC+8 時區
+    tz = timezone(timedelta(hours=8))
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
     
-    embed = discord.Embed(
-        title=f"📅 今日課表 ({today_str})",
-        color=discord.Color.green()
-    )
+    connection = get_db_connection()
+    if not connection:
+        await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+        return
 
-    if today_str in schedule and schedule[today_str]:
-        for course in schedule[today_str]:
-            embed.add_field(
-                name=f"⏰ {course['stime']} - {course['etime']} - {course['title']}",
-                value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
-                inline=False
-            )
-    else:
-        embed.description = "今天沒有安排任何課程喔！"
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT stime, etime, title, description, teacher 
+            FROM schedule 
+            WHERE date = %s 
+            ORDER BY stime
+        """, (today_str,))
         
-    await interaction.response.send_message(embed=embed)
+        rows = cursor.fetchall()
+        
+        embed = discord.Embed(
+            title=f"📅 今日課表 ({today_str})",
+            color=discord.Color.green()
+        )
+
+        if rows:
+            for course in rows:
+                # 處理時間格式
+                stime = str(course['stime'])[:5]
+                etime = str(course['etime'])[:5]
+                
+                embed.add_field(
+                    name=f"⏰ {stime} - {etime} - {course['title']}",
+                    value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
+                    inline=False
+                )
+        else:
+            embed.description = "今天沒有安排任何課程喔！"
+            
+        await interaction.response.send_message(embed=embed)
+        cursor.close()
+        
+    except Error as e:
+        print(f"❌ 查詢課表失敗: {e}")
+        await interaction.response.send_message(f"❌ 查詢課表失敗：{str(e)}", ephemeral=True)
+    finally:
+        if connection.is_connected():
+            connection.close()
 
 @schedule_group.command(name="view", description="查詢指定日期的課表")
 @app_commands.describe(date="要查詢的日期 (格式：YYYY-MM-DD)")
@@ -883,24 +912,49 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         await interaction.response.send_message("日期格式錯誤！請使用 `YYYY-MM-DD` 格式。", ephemeral=True)
         return
 
-    schedule = load_schedule()
-    
-    embed = discord.Embed(
-        title=f"📅 {date} 課表",
-        color=discord.Color.blue()
-    )
+    connection = get_db_connection()
+    if not connection:
+        await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+        return
 
-    if date in schedule and schedule[date]:
-        for course in schedule[date]:
-            embed.add_field(
-                name=f"⏰ {course['stime']} - {course['etime']} - {course['title']}",
-                value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
-                inline=False
-            )
-    else:
-        embed.description = f"在 {date} 沒有安排任何課程。"
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT stime, etime, title, description, teacher 
+            FROM schedule 
+            WHERE date = %s 
+            ORDER BY stime
+        """, (date,))
         
-    await interaction.response.send_message(embed=embed)
+        rows = cursor.fetchall()
+        
+        embed = discord.Embed(
+            title=f"📅 {date} 課表",
+            color=discord.Color.blue()
+        )
+
+        if rows:
+            for course in rows:
+                stime = str(course['stime'])[:5]
+                etime = str(course['etime'])[:5]
+                
+                embed.add_field(
+                    name=f"⏰ {stime} - {etime} - {course['title']}",
+                    value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
+                    inline=False
+                )
+        else:
+            embed.description = f"在 {date} 沒有安排任何課程。"
+            
+        await interaction.response.send_message(embed=embed)
+        cursor.close()
+        
+    except Error as e:
+        print(f"❌ 查詢課表失敗: {e}")
+        await interaction.response.send_message(f"❌ 查詢課表失敗：{str(e)}", ephemeral=True)
+    finally:
+        if connection.is_connected():
+            connection.close()
 
 @schedule_group.command(name="cancel", description="取消一堂課")
 @app_commands.describe(
@@ -932,7 +986,7 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
         # 先查詢課程是否存在，並確認是本人的課程
         select_query = """
             SELECT id, title FROM schedule 
-            WHERE date = %s AND time = %s AND teacher = %s
+            WHERE date = %s AND stime = %s AND teacher = %s
         """
         cursor.execute(select_query, (date, time, interaction.user.display_name))
         course = cursor.fetchone()
@@ -941,7 +995,7 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
             # 沒找到或不是本人的課程
             cursor.execute("""
                 SELECT title FROM schedule 
-                WHERE date = %s AND time = %s
+                WHERE date = %s AND stime = %s
             """, (date, time))
             
             if cursor.fetchone():

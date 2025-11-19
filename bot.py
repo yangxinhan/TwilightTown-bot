@@ -790,11 +790,12 @@ schedule_group = app_commands.Group(name="schedule", description="課表相關�
 @schedule_group.command(name="add", description="新增一堂課至課表")
 @app_commands.describe(
     date="課程日期 (格式：YYYY-MM-DD)",
-    time="課程時間 (格式：HH:MM)",
+    stime="課程時間 (格式：HH:MM)",
+    etime="課程結束時間 (格式：HH:MM)",
     title="課程標題",
     description="課程內容的詳細說明"
 )
-async def add_class(interaction: discord.Interaction, date: str, time: str, title: str, description: str):
+async def add_class(interaction: discord.Interaction, date: str, stime: str, etime: str, title: str, description: str):
     # 簡易的權限檢查，只允許有 "鎮民" 角色的使用者操作
     if not any(role.name == '鎮民' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有鎮民才能新增課程。", ephemeral=True)
@@ -803,7 +804,8 @@ async def add_class(interaction: discord.Interaction, date: str, time: str, titl
     try:
         # 驗證日期與時間格式
         datetime.strptime(date, "%Y-%m-%d")
-        datetime.strptime(time, "%H:%M")
+        datetime.strptime(stime, "%H:%M")
+        datetime.strptime(etime, "%H:%M")
     except ValueError:
         await interaction.response.send_message("日期或時間格式錯誤！請使用 `YYYY-MM-DD` 和 `HH:MM` 格式。", ephemeral=True)
         return
@@ -820,9 +822,9 @@ async def add_class(interaction: discord.Interaction, date: str, time: str, titl
         # 檢查是否已存在相同的課程
         check_query = """
             SELECT id FROM schedule 
-            WHERE date = %s AND time = %s AND title = %s AND teacher = %s
+            WHERE date = %s AND stime = %s AND title = %s AND teacher = %s
         """
-        cursor.execute(check_query, (date, time, title, interaction.user.display_name))
+        cursor.execute(check_query, (date, stime, etime, title, interaction.user.display_name))
         
         if cursor.fetchone():
             await interaction.response.send_message("❌ 此課程已存在，請勿重複新增。", ephemeral=True)
@@ -835,11 +837,11 @@ async def add_class(interaction: discord.Interaction, date: str, time: str, titl
             INSERT INTO schedule (date, time, title, description, teacher)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cursor.execute(insert_query, (date, time, title, description, interaction.user.display_name))
+        cursor.execute(insert_query, (date, stime, etime, title, description, interaction.user.display_name))
         connection.commit()
         
-        await interaction.response.send_message(f"✅ 課程 **{title}** 已成功新增至 **{date}** {time} 的課表。", ephemeral=True)
-        print(f"{interaction.user.display_name} 新增了課程：{date} {time} - {title}")
+        await interaction.response.send_message(f"✅ 課程 **{title}** 已成功新增至 **{date}** {stime}-{etime} 的課表。", ephemeral=True)
+        print(f"{interaction.user.display_name} 新增了課程：{date} {stime}-{etime} - {title}")
         
         cursor.close()
         

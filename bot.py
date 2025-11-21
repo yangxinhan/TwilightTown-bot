@@ -740,7 +740,8 @@ async def dispatch_anonymous_report(
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
-    await bot.change_presence(activity=discord.Game(name="烤羊羊", start=datetime.now()))
+    activity = discord.Activity(name="烤羊羊", type=discord.ActivityType.playing, start=datetime.now())
+    await bot.change_presence(activity=activity)
     # 重新註冊 view 以支援機器人重啟後的舊按鈕交互
     bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow(), preferred_tutor=None))
     bot.add_view(CloseTutoringChannelView(tutor=None, applicant=None))

@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands, ui
 import os
 from dotenv import load_dotenv
@@ -383,7 +383,58 @@ class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
         embed.add_field(name="可配合時段", value=self.schedule.value, inline=False)
         embed.set_footer(text=f"申請人 ID: {interaction.user.id} | ⏰ 24 小時內回應")
 
-        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow(), preferred_tutor=preferred_tutor)
+        # 將申請存入資料庫
+        connection = get_db_connection()
+        if not connection:
+            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+            return
+
+        request_id = None
+        try:
+            cursor = connection.cursor()
+            
+            # 存入資料庫
+            insert_query = """
+                INSERT INTO tutoring_requests 
+                (applicant_id, applicant_name, topic, preferred_tutor_id, preferred_tutor_name, schedule, created_at, status, message_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            preferred_tutor_id = preferred_tutor.id if preferred_tutor else None
+            preferred_tutor_name = preferred_tutor.display_name if preferred_tutor else None
+            
+            cursor.execute(insert_query, (
+                interaction.user.id,
+                interaction.user.display_name,
+                self.topic.value,
+                preferred_tutor_id,
+                preferred_tutor_name,
+                self.schedule.value,
+                datetime.now(),
+                'pending',
+                None  # message_id 將在下方更新
+            ))
+            connection.commit()
+            request_id = cursor.lastrowid
+            cursor.close()
+        except Error as e:
+            print(f"❌ 存入輔導申請失敗: {e}")
+            await interaction.response.send_message(f"❌ 存入資料庫失敗：{str(e)}", ephemeral=True)
+            connection.close()
+            return
+
+        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow(), preferred_tutor=preferred_tutor, request_id=request_id)
+        message = await request_channel.send(embed=embed, view=view)
+        
+        # 更新資料庫中的 message_id
+        try:
+            cursor = connection.cursor()
+            cursor.execute("UPDATE tutoring_requests SET message_id = %s WHERE id = %s", (message.id, request_id))
+            connection.commit()
+            cursor.close()
+        except Error as e:
+            print(f"❌ 更新 message_id 失敗: {e}")
+        finally:
+            connection.close()
         await request_channel.send(embed=embed, view=view)
         
         # 若有指定偏好鎮民，發送一條 tag 訊息
@@ -472,11 +523,12 @@ class CloseTutoringChannelView(ui.View):
 
 # 1b. 輔導申請的按鈕 (View)
 class TutoringRequestView(ui.View):
-    def __init__(self, applicant: discord.Member, created_at: datetime, preferred_tutor: Optional[discord.Member] = None):
+    def __init__(self, applicant: discord.Member, created_at: datetime, preferred_tutor: Optional[discord.Member] = None, request_id: int = None):
         super().__init__(timeout=None)  # 設為 None 讓 view 永久有效，時間檢查在 interaction_check 中進行
         self.applicant = applicant
         self.created_at = created_at
         self.preferred_tutor = preferred_tutor  # 新增：偏好導師
+        self.request_id = request_id  # 新增：資料庫申請 ID
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """檢查時間限制與按鈕權限"""
@@ -509,6 +561,20 @@ class TutoringRequestView(ui.View):
         if self.applicant is None:
             await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
             return
+        
+        # 更新資料庫狀態
+        if self.request_id:
+            connection = get_db_connection()
+            if connection:
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('accepted', self.request_id))
+                    connection.commit()
+                    cursor.close()
+                except Error as e:
+                    print(f"❌ 更新申請狀態失敗: {e}")
+                finally:
+                    connection.close()
         
         tutor = interaction.user
         guild = interaction.guild
@@ -559,6 +625,20 @@ class TutoringRequestView(ui.View):
         if self.applicant is None:
             await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
             return
+        
+        # 更新資料庫狀態
+        if self.request_id:
+            connection = get_db_connection()
+            if connection:
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('declined', self.request_id))
+                    connection.commit()
+                    cursor.close()
+                except Error as e:
+                    print(f"❌ 更新申請狀態失敗: {e}")
+                finally:
+                    connection.close()
         
         self.clear_items()
         original_message = interaction.message
@@ -782,6 +862,68 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(e)
+    
+    # 啟動檢查過期申請的後台任務
+    if not check_expired_tutoring_requests.is_running():
+        check_expired_tutoring_requests.start()
+
+
+# 定期檢查過期輔導申請
+@tasks.loop(hours=1)
+async def check_expired_tutoring_requests():
+    """每小時檢查一次是否有超過 24 小時未回應的申請"""
+    try:
+        connection = get_db_connection()
+        if not connection:
+            print("⚠️ 無法連接資料庫進行過期檢查")
+            return
+        
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查詢所有未回應且超過 24 小時的申請
+        query = """
+            SELECT id, applicant_id, applicant_name, topic, message_id, created_at
+            FROM tutoring_requests
+            WHERE status = 'pending' AND created_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        """
+        cursor.execute(query)
+        expired_requests = cursor.fetchall()
+        
+        for request in expired_requests:
+            try:
+                applicant_id = request['applicant_id']
+                applicant = bot.get_user(applicant_id)
+                
+                if applicant:
+                    # 發送 DM 通知申請人
+                    embed = discord.Embed(
+                        title="⏰ 輔導申請已過期",
+                        description=f"您於 {request['created_at'].strftime('%Y-%m-%d %H:%M')} 提交的輔導申請「**{request['topic']}**」已超過 24 小時未被回應。\n\n"
+                                    "該申請現已標記為過期。若您仍需尋求輔導，請重新提交新的申請。",
+                        color=discord.Color.orange()
+                    )
+                    embed.set_footer(text="申請 ID: " + str(request['id']))
+                    await applicant.send(embed=embed)
+                    print(f"✅ 已發送過期通知給 {request['applicant_name']} (ID: {applicant_id})")
+                
+                # 更新資料庫狀態為 expired
+                cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('expired', request['id']))
+                connection.commit()
+                
+            except Exception as e:
+                print(f"❌ 處理過期申請時出錯 (ID: {request['id']}): {e}")
+        
+        cursor.close()
+        connection.close()
+        
+    except Exception as e:
+        print(f"❌ 檢查過期申請時出錯: {e}")
+
+
+@check_expired_tutoring_requests.before_loop
+async def before_check_expired_tutoring_requests():
+    """在啟動後台任務前等待 bot 完全就緒"""
+    await bot.wait_until_ready()
 
 
 # --- 斜線指令定義 ---

@@ -135,6 +135,7 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
 TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
+TUTORING_ARCHIVE_CATEGORY_ID = int(os.getenv("TUTORING_ARCHIVE_CATEGORY_ID"))
 TAG_PREFERENCE_CHANNEL_ID = int(os.getenv("TAG_PREFERENCE_CHANNEL_ID"))  # Tag偏好頻道ID
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
@@ -463,20 +464,20 @@ class CloseTutoringChannelView(ui.View):
             await interaction.response.send_message("❌ 只有申請人可以關閉此頻道。", ephemeral=True)
             return
 
-        # 取得指定類別（輔導頻道專用）
+        # 取得指定類別（關閉頻道存放區）
         channel = interaction.channel
         guild = channel.guild
         
-        tutoring_category = guild.get_channel(TUTORING_CATEGORY_ID)
+        archive_category = guild.get_channel(TUTORING_ARCHIVE_CATEGORY_ID)
         
-        if tutoring_category is None or not isinstance(tutoring_category, discord.CategoryChannel):
-            await interaction.response.send_message("❌ 找不到輔導頻道類別，請聯絡管理員。", ephemeral=True)
+        if archive_category is None or not isinstance(archive_category, discord.CategoryChannel):
+            await interaction.response.send_message("❌ 找不到頻道存放區類別，請聯絡管理員。", ephemeral=True)
             return
 
-        # 將頻道移到指定類別（會自動加上「已關閉-」前綴以示區別）
+        # 將頻道移到存放區類別（會自動加上「已關閉-」前綴以示區別）
         old_name = channel.name
         new_name = f"已關閉-{old_name}" if not old_name.startswith("已關閉-") else old_name
-        await channel.edit(category=tutoring_category, name=new_name)
+        await channel.edit(category=archive_category, name=new_name)
 
         # 鎖定頻道：禁止所有人（除管理員）傳送訊息
         await channel.set_permissions(

@@ -141,10 +141,10 @@ TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
 # MariaDB 連接設定
 DB_CONFIG = {
-    'host': os.getenv("DB_HOST", "100.106.250.36"),
-    'user': os.getenv("DB_USER", "admin"),
-    'password': os.getenv("DB_PASSWORD", "960404"),
-    'database': os.getenv("DB_NAME", "mydb"),
+    'host': os.getenv("DB_HOST"),
+    'user': os.getenv("DB_USER"),
+    'password': os.getenv("DB_PASSWORD"),
+    'database': os.getenv("DB_NAME"),
     'charset': 'utf8mb4',
     'use_unicode': True
 }
@@ -479,6 +479,23 @@ class CloseTutoringChannelView(ui.View):
         new_name = f"已關閉-{old_name}" if not old_name.startswith("已關閉-") else old_name
         await channel.edit(category=archive_category, name=new_name)
 
+        # 更新資料庫：記錄關閉時間和狀態
+        try:
+            connection = get_db_connection()
+            if connection:
+                cursor = connection.cursor()
+                update_query = """
+                    UPDATE tutoring_channels 
+                    SET closed_at = NOW(), status = %s 
+                    WHERE channel_id = %s
+                """
+                cursor.execute(update_query, ('closed', channel.id))
+                connection.commit()
+                cursor.close()
+                connection.close()
+        except Error as e:
+            print(f"❌ 更新關閉時間失敗: {e}")
+
         # 鎖定頻道：禁止所有人（除管理員）傳送訊息
         await channel.set_permissions(
             guild.default_role,
@@ -569,7 +586,7 @@ class TutoringRequestView(ui.View):
             if connection:
                 try:
                     cursor = connection.cursor()
-                    cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('accepted', self.request_id))
+                    cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('accepted', self.request_id))
                     connection.commit()
                     cursor.close()
                 except Error as e:
@@ -596,6 +613,31 @@ class TutoringRequestView(ui.View):
         }
         channel_name = f"輔導-{self.applicant.name}-{tutor.name}"
         temp_channel = await interaction.guild.create_text_channel(channel_name, overwrites=overwrites, category=tutoring_category)
+
+        # 將頻道記錄存入資料庫
+        try:
+            connection = get_db_connection()
+            if connection:
+                cursor = connection.cursor()
+                insert_query = """
+                    INSERT INTO tutoring_channels 
+                    (channel_id, channel_name, applicant_id, applicant_name, tutor_id, tutor_name, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(insert_query, (
+                    temp_channel.id,
+                    channel_name,
+                    self.applicant.id,
+                    self.applicant.display_name,
+                    tutor.id,
+                    tutor.display_name,
+                    'active'
+                ))
+                connection.commit()
+                cursor.close()
+                connection.close()
+        except Error as e:
+            print(f"❌ 頻道記錄存入失敗: {e}")
 
         # 停用原始訊息的按鈕
         self.clear_items()
@@ -633,7 +675,7 @@ class TutoringRequestView(ui.View):
             if connection:
                 try:
                     cursor = connection.cursor()
-                    cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('declined', self.request_id))
+                    cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('declined', self.request_id))
                     connection.commit()
                     cursor.close()
                 except Error as e:
@@ -867,6 +909,10 @@ async def on_ready():
     # 啟動檢查過期申請的後台任務
     if not check_expired_tutoring_requests.is_running():
         check_expired_tutoring_requests.start()
+    
+    # 啟動刪除過期頻道的後台任務
+    if not delete_archived_tutoring_channels.is_running():
+        delete_archived_tutoring_channels.start()
 
 
 # 定期檢查過期輔導申請
@@ -908,7 +954,7 @@ async def check_expired_tutoring_requests():
                     print(f"✅ 已發送過期通知給 {request['applicant_name']} (ID: {applicant_id})")
                 
                 # 更新資料庫狀態為 expired
-                cursor.execute("UPDATE tutoring_requests SET status = %s WHERE id = %s", ('expired', request['id']))
+                cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('expired', request['id']))
                 connection.commit()
                 
             except Exception as e:
@@ -923,6 +969,62 @@ async def check_expired_tutoring_requests():
 
 @check_expired_tutoring_requests.before_loop
 async def before_check_expired_tutoring_requests():
+    """在啟動後台任務前等待 bot 完全就緒"""
+    await bot.wait_until_ready()
+
+
+# 定期刪除 30 天前關閉的輔導頻道
+@tasks.loop(hours=6)
+async def delete_archived_tutoring_channels():
+    """每 6 小時檢查一次，刪除 30 天前關閉的頻道"""
+    try:
+        connection = get_db_connection()
+        if not connection:
+            print("⚠️ 無法連接資料庫進行刪除檢查")
+            return
+        
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查詢所有已關閉超過 30 天的頻道
+        query = """
+            SELECT id, channel_id, channel_name
+            FROM tutoring_channels
+            WHERE status = 'closed' AND closed_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+        """
+        cursor.execute(query)
+        channels_to_delete = cursor.fetchall()
+        
+        for channel_record in channels_to_delete:
+            try:
+                channel_id = channel_record['channel_id']
+                channel = bot.get_channel(channel_id)
+                
+                if channel:
+                    # 刪除 Discord 頻道
+                    await channel.delete()
+                    print(f"✅ 已刪除過期頻道 {channel_record['channel_name']} (ID: {channel_id})")
+                else:
+                    print(f"⚠️ 找不到頻道 (ID: {channel_id})，但會更新資料庫記錄")
+                
+                # 更新資料庫狀態為 deleted
+                cursor.execute(
+                    "UPDATE tutoring_channels SET status = %s, deleted_at = NOW() WHERE id = %s",
+                    ('deleted', channel_record['id'])
+                )
+                connection.commit()
+                
+            except Exception as e:
+                print(f"❌ 刪除頻道時出錯 (ID: {channel_record['channel_id']}): {e}")
+        
+        cursor.close()
+        connection.close()
+        
+    except Exception as e:
+        print(f"❌ 檢查過期頻道時出錯: {e}")
+
+
+@delete_archived_tutoring_channels.before_loop
+async def before_delete_archived_tutoring_channels():
     """在啟動後台任務前等待 bot 完全就緒"""
     await bot.wait_until_ready()
 
@@ -1110,6 +1212,135 @@ async def view_schedule(interaction: discord.Interaction, date: str):
     finally:
         if connection.is_connected():
             connection.close()
+
+@schedule_group.command(name="edit", description="修改一堂課的資訊")
+@app_commands.describe(
+    date="課程日期 (格式：YYYY-MM-DD)",
+    stime="課程開始時間 (格式：HH:MM)",
+    new_date="新的課程日期 (格式：YYYY-MM-DD，留空則不改)",
+    new_stime="新的課程開始時間 (格式：HH:MM，留空則不改)",
+    new_etime="新的課程結束時間 (格式：HH:MM，留空則不改)",
+    new_title="新的課程標題 (留空則不改)",
+    new_description="新的課程內容說明 (留空則不改)"
+)
+async def edit_class(interaction: discord.Interaction, date: str, stime: str, 
+                     new_date: str = None, new_stime: str = None, new_etime: str = None,
+                     new_title: str = None, new_description: str = None):
+    # 權限檢查
+    if not any(role.name == '鎮民' for role in interaction.user.roles):
+        await interaction.response.send_message("抱歉，只有鎮民才能修改課程。", ephemeral=True)
+        return
+
+    try:
+        # 驗證原始日期與時間格式
+        datetime.strptime(date, "%Y-%m-%d")
+        datetime.strptime(stime, "%H:%M")
+        
+        # 驗證新的日期與時間格式（如果提供）
+        if new_date:
+            datetime.strptime(new_date, "%Y-%m-%d")
+        if new_stime:
+            datetime.strptime(new_stime, "%H:%M")
+        if new_etime:
+            datetime.strptime(new_etime, "%H:%M")
+    except ValueError:
+        await interaction.response.send_message("日期或時間格式錯誤！請使用 `YYYY-MM-DD` 和 `HH:MM` 格式。", ephemeral=True)
+        return
+
+    connection = get_db_connection()
+    if not connection:
+        await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
+        return
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # 查詢原始課程
+        select_query = """
+            SELECT id, title, etime, description FROM schedule 
+            WHERE date = %s AND stime = %s AND teacher = %s
+        """
+        cursor.execute(select_query, (date, stime, interaction.user.display_name))
+        course = cursor.fetchone()
+        
+        if not course:
+            # 沒找到或不是本人的課程
+            cursor.execute("""
+                SELECT title FROM schedule 
+                WHERE date = %s AND stime = %s
+            """, (date, stime))
+            
+            if cursor.fetchone():
+                await interaction.response.send_message("❌ 您只能修改自己的課程。", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ 在 {date} {stime} 沒有找到課程。", ephemeral=True)
+            
+            cursor.close()
+            connection.close()
+            return
+        
+        # 準備更新的值（使用原始值或新值）
+        update_date = new_date if new_date else date
+        update_stime = new_stime if new_stime else stime
+        update_etime = new_etime if new_etime else course['etime']
+        update_title = new_title if new_title else course['title']
+        update_description = new_description if new_description else course['description']
+        
+        # 檢查是否有課程與新的時間衝突（除了當前課程）
+        conflict_query = """
+            SELECT id FROM schedule 
+            WHERE date = %s AND stime = %s AND etime = %s AND title = %s 
+            AND teacher = %s AND id != %s
+        """
+        cursor.execute(conflict_query, (update_date, update_stime, update_etime, update_title, 
+                                        interaction.user.display_name, course['id']))
+        
+        if cursor.fetchone():
+            await interaction.response.send_message("❌ 修改後的課程與其他課程衝突，請檢查時間。", ephemeral=True)
+            cursor.close()
+            connection.close()
+            return
+        
+        # 更新課程
+        update_query = """
+            UPDATE schedule 
+            SET date = %s, stime = %s, etime = %s, title = %s, description = %s 
+            WHERE id = %s
+        """
+        cursor.execute(update_query, (update_date, update_stime, update_etime, update_title, 
+                                      update_description, course['id']))
+        connection.commit()
+        
+        # 構建修改摘要
+        changes = []
+        if new_date and new_date != date:
+            changes.append(f"日期：{date} → {new_date}")
+        if new_stime and new_stime != stime:
+            changes.append(f"開始時間：{stime} → {new_stime}")
+        if new_etime:
+            changes.append(f"結束時間：{course['etime']} → {new_etime}")
+        if new_title:
+            changes.append(f"標題：{course['title']} → {new_title}")
+        if new_description:
+            changes.append(f"描述已更新")
+        
+        change_summary = "\n".join(changes) if changes else "沒有進行任何修改"
+        
+        await interaction.response.send_message(
+            f"✅ 課程 **{course['title']}** 已成功修改。\n\n修改內容：\n{change_summary}",
+            ephemeral=True
+        )
+        print(f"{interaction.user.display_name} 修改了課程 (ID: {course['id']})：\n{change_summary}")
+        
+        cursor.close()
+        
+    except Error as e:
+        print(f"❌ 修改課程失敗: {e}")
+        await interaction.response.send_message(f"❌ 修改課程失敗：{str(e)}", ephemeral=True)
+        connection.rollback()
+    finally:
+        connection.close()
+
 
 @schedule_group.command(name="cancel", description="取消一堂課")
 @app_commands.describe(

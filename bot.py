@@ -1432,7 +1432,7 @@ async def report(interaction: discord.Interaction):
 @bot.tree.command(name="rules", description="顯示微光鎮所有指令的使用方式")
 async def rules(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="� 微光鎮指令使用指南",
+        title="微光鎮指令使用指南",
         description="以下是本伺服器提供的所有指令及其使用方式。",
         color=discord.Color.gold()
     )
@@ -1448,7 +1448,9 @@ async def rules(interaction: discord.Interaction):
             "• **`/schedule view`**\n"
             "  查詢指定日期的課表。需要提供日期 (YYYY-MM-DD)。\n\n"
             "• **`/schedule cancel`**\n"
-            "  取消一堂課。只能取消自己的課程，需要提供日期和時間。"
+            "  取消一堂課。只能取消自己的課程，需要提供日期和時間。\n\n"
+            "• **`/schedule edit`**\n"
+            "  編輯一堂課。只能編輯自己的課程，需要提供日期和時間。可選提供新的日期、時間、標題、描述進行修改。"
         ),
         inline=False
     )

@@ -137,6 +137,7 @@ TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
 TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
 TUTORING_ARCHIVE_CATEGORY_ID = int(os.getenv("TUTORING_ARCHIVE_CATEGORY_ID"))
 TAG_PREFERENCE_CHANNEL_ID = int(os.getenv("TAG_PREFERENCE_CHANNEL_ID"))  # Tag偏好頻道ID
+DAILY_SCHEDULE_CHANNEL_ID = int(os.getenv("DAILY_SCHEDULE_CHANNEL_ID"))  # 每日課表頻道ID
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
 # MariaDB 連接設定
@@ -913,6 +914,10 @@ async def on_ready():
     # 啟動刪除過期頻道的後台任務
     if not delete_archived_tutoring_channels.is_running():
         delete_archived_tutoring_channels.start()
+    
+    # 啟動每日課表傳送任務
+    if not send_daily_schedule.is_running():
+        send_daily_schedule.start()
 
 
 # 定期檢查過期輔導申請
@@ -1025,6 +1030,87 @@ async def delete_archived_tutoring_channels():
 
 @delete_archived_tutoring_channels.before_loop
 async def before_delete_archived_tutoring_channels():
+    """在啟動後台任務前等待 bot 完全就緒"""
+    await bot.wait_until_ready()
+
+
+# 每日早上 10 點傳送今日課表
+@tasks.loop(hours=24)
+async def send_daily_schedule():
+    """每天早上 10 點傳送今日課表"""
+    try:
+        # 檢查當前時間是否為早上 10 點
+        tz = timezone(timedelta(hours=8))
+        now = datetime.now(tz)
+        
+        # 只在早上 10:00-10:05 之間執行（確保只執行一次）
+        if now.hour != 10 or now.minute >= 5:
+            return
+        
+        # 取得課表頻道
+        schedule_channel = bot.get_channel(DAILY_SCHEDULE_CHANNEL_ID)
+        if not schedule_channel:
+            print(f"⚠️ 找不到課表頻道 (ID: {DAILY_SCHEDULE_CHANNEL_ID})")
+            return
+        
+        # 查詢今日課表
+        today_str = now.strftime("%Y-%m-%d")
+        connection = get_db_connection()
+        if not connection:
+            print("⚠️ 無法連接資料庫進行課表查詢")
+            return
+
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT stime, etime, title, description, teacher 
+                FROM schedule 
+                WHERE date = %s 
+                ORDER BY stime
+            """, (today_str,))
+            
+            rows = cursor.fetchall()
+            
+            embed = discord.Embed(
+                title=f"📅 今日課表 ({today_str})",
+                color=discord.Color.green()
+            )
+
+            if rows:
+                for course in rows:
+                    # 處理時間格式
+                    stime = str(course['stime'])
+                    if stime.count(':') >= 2:
+                        stime = stime.rsplit(':', 1)[0]
+                    
+                    etime = str(course['etime'])
+                    if etime.count(':') >= 2:
+                        etime = etime.rsplit(':', 1)[0]
+                    
+                    embed.add_field(
+                        name=f"⏰ {stime}~{etime} {course['title']}",
+                        value=f"**知識分享者:** {course['teacher']}\n**內容:** {course['description']}",
+                        inline=False
+                    )
+            else:
+                embed.description = "今天沒有安排任何課程喔！"
+            
+            embed.set_footer(text=f"生成時間：{now.strftime('%H:%M')}")
+            await schedule_channel.send(embed=embed)
+            print(f"✅ 已於 {now.strftime('%Y-%m-%d %H:%M')} 傳送今日課表到頻道")
+            cursor.close()
+            
+        except Error as e:
+            print(f"❌ 查詢課表失敗: {e}")
+        finally:
+            connection.close()
+            
+    except Exception as e:
+        print(f"❌ 傳送每日課表時出錯: {e}")
+
+
+@send_daily_schedule.before_loop
+async def before_send_daily_schedule():
     """在啟動後台任務前等待 bot 完全就緒"""
     await bot.wait_until_ready()
 

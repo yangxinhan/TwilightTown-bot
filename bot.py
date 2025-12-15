@@ -920,6 +920,27 @@ async def on_ready():
         send_daily_schedule.start()
 
 
+@bot.event
+async def on_disconnect():
+    """Bot 斷線時發送訊息到聊天室"""
+    print("⚠️ Bot 已斷線")
+    try:
+        # 發送訊息到 Admin 頻道
+        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        if admin_channel:
+            embed = discord.Embed(
+                title="🔴 機器人掛掉了",
+                description="機器人已斷線，正在嘗試重新連接...",
+                color=discord.Color.red(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_footer(text="如果持續無法連接，請聯絡管理員")
+            await admin_channel.send(embed=embed)
+            print(f"✅ 斷線訊息已發送到 {admin_channel.name}")
+    except Exception as e:
+        print(f"❌ 無法發送斷線訊息: {e}")
+
+
 # 定期檢查過期輔導申請
 @tasks.loop(hours=1)
 async def check_expired_tutoring_requests():

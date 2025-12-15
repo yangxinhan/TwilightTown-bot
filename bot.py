@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 import mysql.connector
 from mysql.connector import Error
+import asyncio
 
 # Tag 同意度確認按鈕 View
 class TagPreferenceView(ui.View):
@@ -138,6 +139,7 @@ TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
 TUTORING_ARCHIVE_CATEGORY_ID = int(os.getenv("TUTORING_ARCHIVE_CATEGORY_ID"))
 TAG_PREFERENCE_CHANNEL_ID = int(os.getenv("TAG_PREFERENCE_CHANNEL_ID"))  # Tag偏好頻道ID
 DAILY_SCHEDULE_CHANNEL_ID = int(os.getenv("DAILY_SCHEDULE_CHANNEL_ID"))  # 每日課表頻道ID
+DISCONNECTION_NOTIFICATION_CHANNEL_ID = int(os.getenv("DISCONNECTION_NOTIFICATION_CHANNEL_ID"))  # 斷線通知頻道ID
 TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
 
 # MariaDB 連接設定
@@ -325,6 +327,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 追蹤斷線狀態的全局變數
+bot.disconnection_notified = False
 
 # --- UI 元件定義 (Modals & Views) ---
 
@@ -922,23 +927,34 @@ async def on_ready():
 
 @bot.event
 async def on_disconnect():
-    """Bot 斷線時發送訊息到聊天室"""
-    print("⚠️ Bot 已斷線")
-    try:
-        # 發送訊息到 Admin 頻道
-        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_channel:
-            embed = discord.Embed(
-                title="🔴 機器人掛掉了",
-                description="機器人已斷線，正在嘗試重新連接...",
-                color=discord.Color.red(),
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.set_footer(text="如果持續無法連接，請聯絡管理員")
-            await admin_channel.send(embed=embed)
-            print(f"✅ 斷線訊息已發送到 {admin_channel.name}")
-    except Exception as e:
-        print(f"❌ 無法發送斷線訊息: {e}")
+    """Bot 斷線時發送訊息到聊天室（避免誤報）"""
+    print("⚠️ Bot 已斷線，30秒後檢查是否真的持續斷線...")
+    bot.disconnection_notified = False
+    
+    # 等待 30 秒，檢查是否能重新連接
+    await asyncio.sleep(30)
+    
+    # 如果30秒後仍未重新連接且未發送過通知
+    if not bot.is_ready() and not bot.disconnection_notified:
+        print("❌ Bot 仍未重新連接，發送斷線通知")
+        bot.disconnection_notified = True
+        try:
+            # 發送訊息到指定頻道
+            notification_channel = bot.get_channel(DISCONNECTION_NOTIFICATION_CHANNEL_ID)
+            if notification_channel:
+                embed = discord.Embed(
+                    title="🔴 機器人掛掉了",
+                    description="烤羊羊機器人已持續斷線超過 30 秒，請檢查伺服器狀態。",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.set_footer(text="如果持續無法連接，請聯絡管理員檢查網路或伺服器")
+                await notification_channel.send(embed=embed)
+                print(f"✅ 斷線通知已發送到 {notification_channel.name}")
+        except Exception as e:
+            print(f"❌ 無法發送斷線訊息: {e}")
+    else:
+        print("✅ Bot 已成功重新連接，無需發送通知")
 
 
 # 定期檢查過期輔導申請

@@ -700,10 +700,216 @@ class TutoringRequestView(ui.View):
         await self.applicant.send(f"很遺憾，您的輔導申請已被婉拒。若有疑問請聯繫管理員。")
         print(f" {interaction.user.name} 婉拒了 {self.applicant.name} 的申請。")
 
-# 2. 匿名檢舉流程 (Slash Command)
-class ReportModal(ui.Modal):
+# 2. 站務申請系統流程
+# 2.1 申請類型選擇 Select 菜單
+class ApplicationTypeSelect(ui.Select):
     def __init__(self):
-        super().__init__(title="匿名檢舉")
+        options = [
+            discord.SelectOption(label="身分轉換申請（未成年 → 已滿18歲）", value="identity_change", emoji="🆔"),
+            discord.SelectOption(label="權限異動申請", value="permission_change", emoji="🔐"),
+            discord.SelectOption(label="技術或制度問題回報", value="tech_issue", emoji="🔧"),
+            discord.SelectOption(label="聯繫小志工團隊", value="volunteer_contact", emoji="👥"),
+            discord.SelectOption(label="匿名檢舉", value="anonymous_report", emoji="⚠️"),
+        ]
+        super().__init__(
+            placeholder="請選擇申請類型...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="application_type_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        app_type = self.values[0]
+        
+        if app_type == "identity_change":
+            await interaction.response.send_modal(IdentityChangeModal())
+        elif app_type == "permission_change":
+            await interaction.response.send_modal(PermissionChangeModal())
+        elif app_type == "tech_issue":
+            await interaction.response.send_modal(TechIssueModal())
+        elif app_type == "volunteer_contact":
+            await interaction.response.send_modal(VolunteerContactModal())
+        elif app_type == "anonymous_report":
+            await interaction.response.send_modal(AnonymousReportModal())
+
+class ApplicationTypeView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(ApplicationTypeSelect())
+
+# 2.2 身分轉換申請 Modal
+class IdentityChangeModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="🆔 身分轉換申請")
+
+        self.discord_id_input = ui.TextInput(
+            label="Discord ID",
+            placeholder="輸入您的 Discord ID（右鍵複製個人資料中的ID）",
+            required=True
+        )
+        self.add_item(self.discord_id_input)
+
+        self.age_confirm_input = ui.TextInput(
+            label="確認聲明（請輸入「我確認已年滿 18 歲」以表同意）",
+            placeholder="我確認已年滿 18 歲，並理解若虛假申報，將永久失去微光鎮參與資格。",
+            required=True
+        )
+        self.add_item(self.age_confirm_input)
+
+        self.anonymous_input = ui.TextInput(
+            label="是否匿名提交？（輸入「是」或「否」）",
+            placeholder="是 / 否",
+            required=True
+        )
+        self.add_item(self.anonymous_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        confirmation = self.age_confirm_input.value
+        if "確認" not in confirmation and "同意" not in confirmation and "已滿" not in confirmation:
+            await interaction.response.send_message(
+                "❌ 您必須同意年齡聲明才能提交申請。",
+                ephemeral=True
+            )
+            return
+
+        app_data = {
+            "type": "identity_change",
+            "discord_id": self.discord_id_input.value,
+            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"],
+            "current_roles": "未來由系統自動抓取"
+        }
+        
+        await dispatch_official_application(interaction, app_data)
+
+# 2.3 權限異動申請 Modal
+class PermissionChangeModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="🔐 權限異動申請")
+
+        self.discord_id_input = ui.TextInput(
+            label="Discord ID",
+            placeholder="輸入您的 Discord ID",
+            required=True
+        )
+        self.add_item(self.discord_id_input)
+
+        self.reason_input = ui.TextInput(
+            label="申請原因/說明",
+            style=discord.TextStyle.paragraph,
+            placeholder="請詳細說明需要權限異動的原因...",
+            required=True,
+            max_length=1900
+        )
+        self.add_item(self.reason_input)
+
+        self.anonymous_input = ui.TextInput(
+            label="是否匿名提交？（輸入「是」或「否」）",
+            placeholder="是 / 否",
+            required=True
+        )
+        self.add_item(self.anonymous_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        app_data = {
+            "type": "permission_change",
+            "discord_id": self.discord_id_input.value,
+            "reason": self.reason_input.value,
+            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+        }
+        
+        await dispatch_official_application(interaction, app_data)
+
+# 2.4 技術或制度問題回報 Modal
+class TechIssueModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="🔧 技術或制度問題回報")
+
+        self.discord_id_input = ui.TextInput(
+            label="Discord ID (選填)",
+            placeholder="輸入您的 Discord ID（若想匿名則可不填）",
+            required=False
+        )
+        self.add_item(self.discord_id_input)
+
+        self.issue_input = ui.TextInput(
+            label="問題說明",
+            style=discord.TextStyle.paragraph,
+            placeholder="請詳細描述遇到的技術或制度問題...",
+            required=True,
+            max_length=1900
+        )
+        self.add_item(self.issue_input)
+
+        self.anonymous_input = ui.TextInput(
+            label="是否匿名提交？（輸入「是」或「否」）",
+            placeholder="是 / 否",
+            required=True
+        )
+        self.add_item(self.anonymous_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        app_data = {
+            "type": "tech_issue",
+            "discord_id": self.discord_id_input.value or "匿名",
+            "issue": self.issue_input.value,
+            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+        }
+        
+        await dispatch_official_application(interaction, app_data)
+
+# 2.5 聯繫小志工團隊 Modal
+class VolunteerContactModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="👥 聯繫小志工團隊")
+
+        self.discord_id_input = ui.TextInput(
+            label="Discord ID (選填)",
+            placeholder="輸入您的 Discord ID（若想匿名則可不填）",
+            required=False
+        )
+        self.add_item(self.discord_id_input)
+
+        self.content_input = ui.TextInput(
+            label="企畫內容與說明",
+            style=discord.TextStyle.paragraph,
+            placeholder="請放上企畫內容、推廣理由、想合作的內容、時間長短等詳細資訊...",
+            required=True,
+            max_length=1900
+        )
+        self.add_item(self.content_input)
+
+        self.document_link_input = ui.TextInput(
+            label="文件超連結 (選填)",
+            style=discord.TextStyle.paragraph,
+            placeholder="可貼上相關文件的超連結...",
+            required=False,
+            max_length=1900
+        )
+        self.add_item(self.document_link_input)
+
+        self.anonymous_input = ui.TextInput(
+            label="是否匿名提交？（輸入「是」或「否」）",
+            placeholder="是 / 否",
+            required=True
+        )
+        self.add_item(self.anonymous_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        app_data = {
+            "type": "volunteer_contact",
+            "discord_id": self.discord_id_input.value or "匿名",
+            "content": self.content_input.value,
+            "document_link": self.document_link_input.value,
+            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+        }
+        
+        await dispatch_official_application(interaction, app_data)
+
+# 2.6 匿名檢舉 Modal (升級版)
+class AnonymousReportModal(ui.Modal):
+    def __init__(self):
+        super().__init__(title="⚠️ 匿名檢舉")
 
         self.target_user_input = ui.TextInput(
             label="檢舉對象的使用者名稱或ID",
@@ -732,6 +938,7 @@ class ReportModal(ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         report_data = {
+            "type": "anonymous_report",
             "target_user": self.target_user_input.value,
             "reason": self.reason_input.value,
             "additional_context": self.additional_context_input.value
@@ -810,6 +1017,80 @@ class AttachmentUploadModal(ui.Modal):
         
         await dm_channel.send("✅ 您的檢舉已送出，感謝您的回報！")
 
+
+
+async def dispatch_official_application(
+    interaction: discord.Interaction,
+    app_data: dict
+) -> None:
+    """將站務申請送至管理員頻道。根據申請類型顯示不同的 Embed。"""
+    admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
+    if not admin_channel_id:
+        await interaction.response.send_message("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
+        return
+
+    admin_channel = bot.get_channel(int(admin_channel_id))
+    if not admin_channel:
+        await interaction.response.send_message("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
+        return
+
+    app_type = app_data.get("type")
+    is_anonymous = app_data.get("is_anonymous", False)
+    
+    # 根據申請類型生成不同的 Embed
+    if app_type == "identity_change":
+        embed = discord.Embed(
+            title="🆔 身分轉換申請",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="申請人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="申請事由", value="年齡身分轉換（未成年 → 已滿 18）", inline=False)
+        embed.add_field(name="聲明", value="申請人已確認聲明內容", inline=False)
+        
+    elif app_type == "permission_change":
+        embed = discord.Embed(
+            title="🔐 權限異動申請",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="申請人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="申請原因", value=app_data.get("reason"), inline=False)
+        
+    elif app_type == "tech_issue":
+        embed = discord.Embed(
+            title="🔧 技術或制度問題回報",
+            color=discord.Color.gold()
+        )
+        if app_data.get("discord_id") != "匿名":
+            embed.add_field(name="回報人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="問題說明", value=app_data.get("issue"), inline=False)
+        
+    elif app_type == "volunteer_contact":
+        embed = discord.Embed(
+            title="👥 聯繫小志工團隊",
+            color=discord.Color.purple()
+        )
+        if app_data.get("discord_id") != "匿名":
+            embed.add_field(name="聯繫人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="企畫內容與說明", value=app_data.get("content"), inline=False)
+        if app_data.get("document_link"):
+            embed.add_field(name="文件超連結", value=app_data.get("document_link"), inline=False)
+    
+    else:
+        # 不應該執行到這裡，但為了安全起見
+        embed = discord.Embed(title="站務申請", color=discord.Color.default())
+
+    # 添加匿名標籤
+    if is_anonymous:
+        embed.add_field(name="提交方式", value="✅ 匿名提交", inline=False)
+    else:
+        embed.add_field(name="提交方式", value="❌ 非匿名提交", inline=False)
+
+    embed.set_footer(text="📨 微光鎮｜站務申請與回報系統")
+    embed.timestamp = datetime.now(timezone.utc)
+
+    await admin_channel.send(embed=embed)
+    await interaction.response.send_message("✅ 您的申請已成功提交，感謝您的支持！", ephemeral=True)
+    print(f"收到一則站務申請：{app_type}，提交方式：{'匿名' if is_anonymous else '非匿名'}")
 
 
 async def dispatch_anonymous_report(
@@ -1547,9 +1828,15 @@ async def apply_tutoring(interaction: discord.Interaction):
     await interaction.response.send_modal(TutoringApplyModal())
 
 # 2. 匿名檢舉指令
-@bot.tree.command(name="report", description="匿名檢舉違規行為")
-async def report(interaction: discord.Interaction):
-    await interaction.response.send_modal(ReportModal())
+@bot.tree.command(name="apply", description="📨 微光鎮｜站務申請與回報系統")
+async def official_application(interaction: discord.Interaction):
+    """開啟站務申請系統，允許使用者選擇申請類型"""
+    await interaction.response.send_message(
+        "👋 歡迎使用微光鎮站務申請與回報系統\n\n"
+        "請選擇您的申請類型：",
+        view=ApplicationTypeView(),
+        ephemeral=True
+    )
 
 # 3. 指令使用指南
 @bot.tree.command(name="rules", description="顯示微光鎮所有指令的使用方式")
@@ -1594,14 +1881,20 @@ async def rules(interaction: discord.Interaction):
     
     # 檢舉相關指令
     embed.add_field(
-        name="⚠️ 匿名檢舉 (`/report`)",
+        name="📨 站務申請與回報系統 (`/apply`)",
         value=(
-            "匿名檢舉違規行為。執行後會彈出檢舉表，流程如下：\n"
-            "1️⃣ 填寫檢舉對象、事由、補充說明\n"
-            "2️⃣ 提交後選擇是否上傳附件：\n"
-            "   • 選「新增附件並提交」→ 填寫附件說明 → 在 DM 上傳檔案\n"
-            "   • 選「直接提交」→ 無附件直接送出\n\n"
-            "系統會將您的檢舉匿名轉交給管理員。"
+            "微光鎮的統一申請與回報平台。執行後會彈出選單，可選擇以下申請類型：\n\n"
+            "🆔 **身分轉換申請**（未成年 → 已滿18歲）\n"
+            "   • 需提供 Discord ID 並確認年齡聲明\n\n"
+            "🔐 **權限異動申請**\n"
+            "   • 提供 Discord ID 和申請原因\n\n"
+            "🔧 **技術或制度問題回報**\n"
+            "   • 回報系統或制度相關問題\n\n"
+            "👥 **聯繫小志工團隊**\n"
+            "   • 企畫合作、洽詢其他問題\n\n"
+            "⚠️ **匿名檢舉**\n"
+            "   • 檢舉違規行為，支援附件上傳\n\n"
+            "所有申請均支持選擇是否匿名提交。"
         ),
         inline=False
     )
@@ -1614,7 +1907,7 @@ async def rules(interaction: discord.Interaction):
             "• 不可私下透過非平台渠道聯繫\n"
             "• 建議所有對談錄音或有第三者陪同以保障雙方權益\n"
             "• 與未成年者互動需更加謹慎，禁止單獨私下見面\n"
-            "• 若發現違規行為，可使用 `/report` 進行檢舉"
+            "• 若發現違規行為，可使用 `/apply` → 匿名檢舉進行回報"
         ),
         inline=False
     )

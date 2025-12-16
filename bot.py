@@ -757,13 +757,6 @@ class IdentityChangeModal(ui.Modal):
         )
         self.add_item(self.age_confirm_input)
 
-        self.anonymous_input = ui.TextInput(
-            label="是否匿名提交？（輸入「是」或「否」）",
-            placeholder="是 / 否",
-            required=True
-        )
-        self.add_item(self.anonymous_input)
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         confirmation = self.age_confirm_input.value
         if "確認" not in confirmation and "同意" not in confirmation and "已滿" not in confirmation:
@@ -776,7 +769,7 @@ class IdentityChangeModal(ui.Modal):
         app_data = {
             "type": "identity_change",
             "discord_id": self.discord_id_input.value,
-            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"],
+            "is_anonymous": False,
             "current_roles": "未來由系統自動抓取"
         }
         
@@ -803,19 +796,12 @@ class PermissionChangeModal(ui.Modal):
         )
         self.add_item(self.reason_input)
 
-        self.anonymous_input = ui.TextInput(
-            label="是否匿名提交？（輸入「是」或「否」）",
-            placeholder="是 / 否",
-            required=True
-        )
-        self.add_item(self.anonymous_input)
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         app_data = {
             "type": "permission_change",
             "discord_id": self.discord_id_input.value,
             "reason": self.reason_input.value,
-            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+            "is_anonymous": False
         }
         
         await dispatch_official_application(interaction, app_data)
@@ -841,19 +827,12 @@ class TechIssueModal(ui.Modal):
         )
         self.add_item(self.issue_input)
 
-        self.anonymous_input = ui.TextInput(
-            label="是否匿名提交？（輸入「是」或「否」）",
-            placeholder="是 / 否",
-            required=True
-        )
-        self.add_item(self.anonymous_input)
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         app_data = {
             "type": "tech_issue",
             "discord_id": self.discord_id_input.value or "匿名",
             "issue": self.issue_input.value,
-            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+            "is_anonymous": False
         }
         
         await dispatch_official_application(interaction, app_data)
@@ -888,20 +867,13 @@ class VolunteerContactModal(ui.Modal):
         )
         self.add_item(self.document_link_input)
 
-        self.anonymous_input = ui.TextInput(
-            label="是否匿名提交？（輸入「是」或「否」）",
-            placeholder="是 / 否",
-            required=True
-        )
-        self.add_item(self.anonymous_input)
-
     async def on_submit(self, interaction: discord.Interaction) -> None:
         app_data = {
             "type": "volunteer_contact",
             "discord_id": self.discord_id_input.value or "匿名",
             "content": self.content_input.value,
             "document_link": self.document_link_input.value,
-            "is_anonymous": self.anonymous_input.value.lower() in ["是", "yes", "true"]
+            "is_anonymous": False
         }
         
         await dispatch_official_application(interaction, app_data)
@@ -1019,6 +991,22 @@ class AttachmentUploadModal(ui.Modal):
 
 
 
+async def get_user_display_name(bot: discord.Client, user_id_str: str) -> str:
+    """將 Discord ID 轉換為用戶名稱。若無法獲取則返回 ID。"""
+    if user_id_str == "匿名":
+        return "匿名提交"
+    
+    try:
+        user_id = int(user_id_str)
+        user = await bot.fetch_user(user_id)
+        if user:
+            return f"{user.name}（ID: {user_id}）"
+        else:
+            return f"未知用戶（ID: {user_id}）"
+    except (ValueError, discord.NotFound, discord.HTTPException):
+        return f"ID: {user_id_str}"
+
+
 async def dispatch_official_application(
     interaction: discord.Interaction,
     app_data: dict
@@ -1037,13 +1025,16 @@ async def dispatch_official_application(
     app_type = app_data.get("type")
     is_anonymous = app_data.get("is_anonymous", False)
     
+    # 獲取用戶顯示名稱
+    discord_id_display = await get_user_display_name(bot, app_data.get("discord_id", ""))
+    
     # 根據申請類型生成不同的 Embed
     if app_type == "identity_change":
         embed = discord.Embed(
             title="🆔 身分轉換申請",
             color=discord.Color.blurple()
         )
-        embed.add_field(name="申請人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="申請人", value=discord_id_display, inline=False)
         embed.add_field(name="申請事由", value="年齡身分轉換（未成年 → 已滿 18）", inline=False)
         embed.add_field(name="聲明", value="申請人已確認聲明內容", inline=False)
         
@@ -1052,7 +1043,7 @@ async def dispatch_official_application(
             title="🔐 權限異動申請",
             color=discord.Color.green()
         )
-        embed.add_field(name="申請人Discord ID", value=app_data.get("discord_id"), inline=False)
+        embed.add_field(name="申請人", value=discord_id_display, inline=False)
         embed.add_field(name="申請原因", value=app_data.get("reason"), inline=False)
         
     elif app_type == "tech_issue":
@@ -1061,7 +1052,7 @@ async def dispatch_official_application(
             color=discord.Color.gold()
         )
         if app_data.get("discord_id") != "匿名":
-            embed.add_field(name="回報人Discord ID", value=app_data.get("discord_id"), inline=False)
+            embed.add_field(name="回報人", value=discord_id_display, inline=False)
         embed.add_field(name="問題說明", value=app_data.get("issue"), inline=False)
         
     elif app_type == "volunteer_contact":
@@ -1070,7 +1061,7 @@ async def dispatch_official_application(
             color=discord.Color.purple()
         )
         if app_data.get("discord_id") != "匿名":
-            embed.add_field(name="聯繫人Discord ID", value=app_data.get("discord_id"), inline=False)
+            embed.add_field(name="聯繫人", value=discord_id_display, inline=False)
         embed.add_field(name="企畫內容與說明", value=app_data.get("content"), inline=False)
         if app_data.get("document_link"):
             embed.add_field(name="文件超連結", value=app_data.get("document_link"), inline=False)

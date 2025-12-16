@@ -1051,7 +1051,8 @@ async def dispatch_official_application(
             title="🔧 技術或制度問題回報",
             color=discord.Color.gold()
         )
-        if app_data.get("discord_id") != "匿名":
+        # 如果有 discord_id 且不是空字符串，顯示用戶名稱
+        if app_data.get("discord_id"):
             embed.add_field(name="回報人", value=discord_id_display, inline=False)
         embed.add_field(name="問題說明", value=app_data.get("issue"), inline=False)
         
@@ -1060,7 +1061,8 @@ async def dispatch_official_application(
             title="👥 聯繫小志工團隊",
             color=discord.Color.purple()
         )
-        if app_data.get("discord_id") != "匿名":
+        # 如果有 discord_id 且不是空字符串，顯示用戶名稱
+        if app_data.get("discord_id"):
             embed.add_field(name="聯繫人", value=discord_id_display, inline=False)
         embed.add_field(name="企畫內容與說明", value=app_data.get("content"), inline=False)
         if app_data.get("document_link"):
@@ -1102,11 +1104,14 @@ async def dispatch_anonymous_report(
         await interaction.followup.send("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
         return
 
+    # 嘗試將檢舉對象轉換為用戶名稱
+    target_user_display = await get_user_display_name(bot, target_user)
+
     embed = discord.Embed(
         title="⚠️ 收到新的匿名檢舉",
         color=discord.Color.orange()
     )
-    embed.add_field(name="檢舉對象", value=target_user, inline=False)
+    embed.add_field(name="檢舉對象", value=target_user_display, inline=False)
     embed.add_field(name="事由", value=reason, inline=False)
 
     evidence_lines = []

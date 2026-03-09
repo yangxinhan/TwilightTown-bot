@@ -1314,7 +1314,7 @@ async def on_ready():
 @bot.event
 async def on_disconnect():
     """Bot 斷線時發送訊息到聊天室（避免誤報）"""
-    await send_log("⚠️ Bot 已斷線，30秒後檢查是否真的持續斷線...", "WARNING")
+    await send_log("⚠️ Bot 已斷線", "WARNING")
     print("⚠️ Bot 已斷線，30秒後檢查是否真的持續斷線...")
     bot.disconnection_notified = False
     

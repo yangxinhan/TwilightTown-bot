@@ -3,11 +3,11 @@ from discord.ext import commands, tasks
 from discord import app_commands, ui
 import os
 from dotenv import load_dotenv
-import json
+
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
-import mysql.connector
-from mysql.connector import Error
+
+from mysql.connector import Error, pooling
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
@@ -189,6 +189,18 @@ DB_CONFIG = {
     'use_unicode': True
 }
 
+try:
+    db_pool = pooling.MySQLConnectionPool(
+        pool_name="twilight_pool",
+        pool_size=10,
+        pool_reset_session=True,
+        **DB_CONFIG
+    )
+    logger.info("✅ 資料庫連接池建立成功")
+except Error as e:
+    logger.error(f"❌ 資料庫連接池建立失敗: {e}")
+    db_pool = None
+
 # --- 日志發送函數 ---
 async def send_log(message: str, level: str = "INFO", embed: discord.Embed = None):
     """
@@ -235,13 +247,14 @@ async def send_log(message: str, level: str = "INFO", embed: discord.Embed = Non
 
 # --- 資料庫連接函數 ---
 def get_db_connection():
-    """建立並返回資料庫連接"""
+    """從連接池獲取資料庫連接"""
+    if not db_pool:
+        return None
     try:
-        connection = mysql.connector.connect(**DB_CONFIG)
-        logger.debug("✅ 資料庫連接成功")
+        connection = db_pool.get_connection()
         return connection
     except Error as e:
-        error_msg = f"❌ 資料庫連接失敗: {e}"
+        error_msg = f"❌ 從連接池獲取資料庫連接失敗: {e}"
         logger.error(error_msg)
         print(error_msg)
         return None

@@ -193,7 +193,30 @@
 1. 在樹莓派 MariaDB 執行 `init_db.sql`
 2. 更新 `.env` 檔，設定資料庫連接資訊
 3. （可選）執行 `migrate_to_db.py` 遷移舊的 JSON 資料
-4. 啟動 Bot
+4. 使用 Docker Compose 啟動 Bot：
+   ```bash
+   docker compose up -d
+   ```
 
 ---
 
+## 🐳 使用 Docker 部署
+
+本專案支援使用 Docker Compose 進行部署，只需簡單幾個步驟即可啟動：
+
+1. 確保已安裝 Docker 與 Docker Compose
+2. 確保專案根目錄下有正確設定的 `.env` 檔案
+3. 執行以下指令啟動容器：
+
+```bash
+# 背景啟動 Bot
+docker compose up -d
+
+# 查看執行日誌
+docker compose logs -f
+
+# 停止 Bot
+docker compose down
+```
+
+---

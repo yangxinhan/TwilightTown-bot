@@ -4,142 +4,110 @@ from discord import app_commands, ui
 import os
 from dotenv import load_dotenv
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
+from contextlib import contextmanager
 from typing import Optional, List
 
 from mysql.connector import Error, pooling
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+from weakref import WeakValueDictionary
 
-# 日志配置
+from tutoring_store import TutoringStore
+
 logger = logging.getLogger('TwilightTown-Bot')
-logger.setLevel(logging.INFO)
+logger.addHandler(logging.NullHandler())
 
-# 文件日志處理器
-log_dir = 'logs'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-file_handler = RotatingFileHandler(
-    os.path.join(log_dir, 'bot.log'),
-    maxBytes=10*1024*1024,  # 10MB
-    backupCount=5,
-    encoding='utf-8'
-)
-file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(file_formatter)
-logger.addHandler(file_handler)
 
-# 控制台日志處理器
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(console_formatter)
-logger.addHandler(console_handler)
+def configure_logging():
+    """Create file/console handlers only when starting the bot."""
+    if any(isinstance(handler, RotatingFileHandler) for handler in logger.handlers):
+        return
+    os.makedirs('logs', exist_ok=True)
+    file_handler = RotatingFileHandler(
+        'logs/bot.log', maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
+    )
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
-# Tag 同意度確認按鈕 View
+
+def safe_db_call(operation):
+    """Cleanup on a dropped connection must not hide the original failure."""
+    try:
+        operation()
+    except Error:
+        logger.warning("資料庫資源清理失敗", exc_info=True)
+
+
+def close_db_resources(cursor, connection):
+    if cursor is not None:
+        safe_db_call(cursor.close)
+    if connection is not None:
+        safe_db_call(connection.close)
+
+
+@contextmanager
+def database_cursor(*, write=False, dictionary=False):
+    connection = get_db_connection()
+    if connection is None:
+        raise Error("無法連接資料庫")
+    cursor = None
+    try:
+        cursor = connection.cursor(dictionary=dictionary, buffered=True)
+        yield cursor
+        if write:
+            connection.commit()
+    except Exception:
+        if write:
+            safe_db_call(connection.rollback)
+        raise
+    finally:
+        close_db_resources(cursor, connection)
+
+
+def set_tag_preference(user_id, accepted):
+    with database_cursor(write=True) as cursor:
+        cursor.execute("SELECT id FROM user_tag_preferences WHERE user_id = %s", (user_id,))
+        if cursor.fetchone():
+            cursor.execute(
+                "UPDATE user_tag_preferences SET tag_accepted = %s, updated_at = NOW() WHERE user_id = %s",
+                (accepted, user_id),
+            )
+        else:
+            cursor.execute(
+                """INSERT INTO user_tag_preferences (user_id, tag_accepted, created_at, updated_at)
+                   VALUES (%s, %s, NOW(), NOW())""", (user_id, accepted),
+            )
+
+
 class TagPreferenceView(ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # 永久有效
+        super().__init__(timeout=None)
+
+    async def _set_preference(self, interaction, accepted):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await asyncio.to_thread(set_tag_preference, interaction.user.id, accepted)
+        except Error:
+            logger.exception("設定 Tag 偏好失敗 (user_id=%s)", interaction.user.id)
+            await interaction.followup.send("❌ 設定失敗，請稍後重試。", ephemeral=True)
+            return
+        message = "✅ 感謝！您已同意接受 Tag。" if accepted else "❌ 已記錄。您的 Tag 將被設為不接受。"
+        await interaction.followup.send(message, ephemeral=True)
+        await send_log(f"使用者 {interaction.user.id} 已{'接受' if accepted else '拒絕'} Tag。", "SUCCESS")
 
     @ui.button(label="✅ 接受 Tag", style=discord.ButtonStyle.success, custom_id="accept_tag")
     async def accept_tag(self, interaction: discord.Interaction, button: ui.Button):
-        """使用者接受 Tag"""
-        user_id = interaction.user.id
-        connection = get_db_connection()
-        if not connection:
-            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
-            await send_log(f"❌ 無法連接資料庫以更新 {interaction.user.name} (ID: {user_id}) 的 Tag 偏好", "ERROR")
-            return
-
-        try:
-            cursor = connection.cursor()
-            
-            # 檢查該使用者是否已有紀錄
-            cursor.execute("SELECT id FROM user_tag_preferences WHERE user_id = %s", (user_id,))
-            existing = cursor.fetchone()
-            
-            if existing:
-                # 更新現有紀錄
-                cursor.execute("""
-                    UPDATE user_tag_preferences 
-                    SET tag_accepted = TRUE, updated_at = NOW()
-                    WHERE user_id = %s
-                """, (user_id,))
-            else:
-                # 插入新紀錄
-                cursor.execute("""
-                    INSERT INTO user_tag_preferences (user_id, tag_accepted, created_at, updated_at)
-                    VALUES (%s, TRUE, NOW(), NOW())
-                """, (user_id,))
-            
-            connection.commit()
-            await interaction.response.send_message(
-                "✅ 感謝！您已同意接受 Tag。",
-                ephemeral=True
-            )
-            await send_log(f"✅ 使用者 {interaction.user.name} (ID: {user_id}) 已接受 Tag。", "SUCCESS")
-            print(f"使用者 {interaction.user.name} (ID: {user_id}) 已接受 Tag。")
-            
-        except Error as e:
-            error_msg = f"❌ 設定 Tag 偏好失敗: {e}"
-            print(error_msg)
-            await send_log(error_msg, "ERROR")
-            await interaction.response.send_message("❌ 設定失敗，請稍後重試。", ephemeral=True)
-            connection.rollback()
-        finally:
-            cursor.close()
-            connection.close()
+        await self._set_preference(interaction, True)
 
     @ui.button(label="❌ 拒絕 Tag", style=discord.ButtonStyle.danger, custom_id="decline_tag")
     async def decline_tag(self, interaction: discord.Interaction, button: ui.Button):
-        """使用者拒絕 Tag"""
-        user_id = interaction.user.id
-        connection = get_db_connection()
-        if not connection:
-            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
-            await send_log(f"❌ 無法連接資料庫以更新 {interaction.user.name} (ID: {user_id}) 的 Tag 偏好", "ERROR")
-            return
-
-        try:
-            cursor = connection.cursor()
-            
-            # 檢查該使用者是否已有紀錄
-            cursor.execute("SELECT id FROM user_tag_preferences WHERE user_id = %s", (user_id,))
-            existing = cursor.fetchone()
-            
-            if existing:
-                # 更新現有紀錄
-                cursor.execute("""
-                    UPDATE user_tag_preferences 
-                    SET tag_accepted = FALSE, updated_at = NOW()
-                    WHERE user_id = %s
-                """, (user_id,))
-            else:
-                # 插入新紀錄
-                cursor.execute("""
-                    INSERT INTO user_tag_preferences (user_id, tag_accepted, created_at, updated_at)
-                    VALUES (%s, FALSE, NOW(), NOW())
-                """, (user_id,))
-            
-            connection.commit()
-            await interaction.response.send_message(
-                "❌ 已記錄。您的 Tag 將被設為不接受。",
-                ephemeral=True
-            )
-            await send_log(f"❌ 使用者 {interaction.user.name} (ID: {user_id}) 已拒絕 Tag。", "SUCCESS")
-            print(f"使用者 {interaction.user.name} (ID: {user_id}) 已拒絕 Tag。")
-            
-        except Error as e:
-            error_msg = f"❌ 設定 Tag 偏好失敗: {e}"
-            print(error_msg)
-            await send_log(error_msg, "ERROR")
-            await interaction.response.send_message("❌ 設定失敗，請稍後重試。", ephemeral=True)
-            connection.rollback()
-        finally:
-            cursor.close()
-            connection.close()
+        await self._set_preference(interaction, False)
 
 # 檢舉文件確認按鈕 View
 class ConfirmReportView(ui.View):
@@ -167,39 +135,58 @@ class ConfirmReportView(ui.View):
         self.stop()
 
 # --- 環境變數與常數定義 ---
-load_dotenv()
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
-TUTORING_REQUEST_CHANNEL_ID = int(os.getenv("TUTORING_REQUEST_CHANNEL_ID"))
-TUTORING_CATEGORY_ID = int(os.getenv("TUTORING_CATEGORY_ID"))
-TUTORING_ARCHIVE_CATEGORY_ID = int(os.getenv("TUTORING_ARCHIVE_CATEGORY_ID"))
-TAG_PREFERENCE_CHANNEL_ID = int(os.getenv("TAG_PREFERENCE_CHANNEL_ID"))  # Tag偏好頻道ID
-DAILY_SCHEDULE_CHANNEL_ID = int(os.getenv("DAILY_SCHEDULE_CHANNEL_ID"))  # 每日課表頻道ID
-DISCONNECTION_NOTIFICATION_CHANNEL_ID = int(os.getenv("DISCONNECTION_NOTIFICATION_CHANNEL_ID"))  # 斷線通知頻道ID
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))  # 日志頻道ID（可選）
-TUTORING_REQUEST_TIMEOUT = 86400  # 24 小時（秒）
+CHANNEL_ID_SETTINGS = (
+    'ADMIN_CHANNEL_ID', 'TUTORING_REQUEST_CHANNEL_ID', 'TUTORING_CATEGORY_ID',
+    'TUTORING_ARCHIVE_CATEGORY_ID', 'TAG_PREFERENCE_CHANNEL_ID',
+    'DAILY_SCHEDULE_CHANNEL_ID', 'DISCONNECTION_NOTIFICATION_CHANNEL_ID',
+)
 
-# MariaDB 連接設定
-DB_CONFIG = {
-    'host': os.getenv("DB_HOST"),
-    'user': os.getenv("DB_USER"),
-    'password': os.getenv("DB_PASSWORD"),
-    'database': os.getenv("DB_NAME"),
-    'charset': 'utf8mb4',
-    'use_unicode': True
-}
 
-try:
-    db_pool = pooling.MySQLConnectionPool(
-        pool_name="twilight_pool",
-        pool_size=10,
-        pool_reset_session=True,
-        **DB_CONFIG
-    )
-    logger.info("✅ 資料庫連接池建立成功")
-except Error as e:
-    logger.error(f"❌ 資料庫連接池建立失敗: {e}")
-    db_pool = None
+def load_configuration(*, required=False):
+    """Allow offline imports; validate required settings at process startup."""
+    settings = {}
+    for name in (*CHANNEL_ID_SETTINGS, 'LOG_CHANNEL_ID'):
+        raw = os.getenv(name, '0')
+        try:
+            value = int(raw)
+        except ValueError:
+            if required:
+                raise ValueError(f"請設定有效的 {name}") from None
+            value = 0
+        if required and ((name in CHANNEL_ID_SETTINGS and value <= 0)
+                         or (name == 'LOG_CHANNEL_ID' and value < 0)):
+            raise ValueError(f"請設定有效的 {name}")
+        settings[name] = value
+    token = os.getenv('DISCORD_BOT_TOKEN')
+    if required and not token:
+        raise ValueError("請設定 DISCORD_BOT_TOKEN")
+    globals().update(settings)
+    globals()['DISCORD_BOT_TOKEN'] = token
+    globals()['DB_CONFIG'] = {
+        'host': os.getenv('DB_HOST'), 'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD'), 'database': os.getenv('DB_NAME'),
+        'charset': 'utf8mb4', 'use_unicode': True,
+    }
+
+
+load_configuration()
+
+db_pool = None
+
+
+def initialize_database():
+    global db_pool
+    try:
+        db_pool = pooling.MySQLConnectionPool(
+            pool_name="twilight_pool",
+            pool_size=10,
+            pool_reset_session=True,
+            **DB_CONFIG
+        )
+        logger.info("✅ 資料庫連接池建立成功")
+    except Error as e:
+        logger.error(f"❌ 資料庫連接池建立失敗: {e}")
+        db_pool = None
 
 # --- 日志發送函數 ---
 async def send_log(message: str, level: str = "INFO", embed: discord.Embed = None):
@@ -266,32 +253,17 @@ def can_tag_user(user_id: int) -> bool:
     - True: 可以 Tag（使用者接受或沒有設定過）
     - False: 不可以 Tag（使用者明確拒絕）
     """
-    connection = get_db_connection()
-    if not connection:
-        return True  # 若無法連接資料庫，預設允許 Tag（保險起見）
-    
     try:
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT tag_accepted FROM user_tag_preferences 
-            WHERE user_id = %s
-        """, (user_id,))
-        
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result is None:
-            # 沒有設定過，視為可以 Tag
-            return True
-        else:
-            # 返回使用者設定的偏好
-            return result['tag_accepted']
-    
-    except Error as e:
-        print(f"❌ 檢查 Tag 偏好失敗: {e}")
-        return True  # 出錯時預設允許 Tag
-    finally:
-        connection.close()
+        with database_cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT tag_accepted FROM user_tag_preferences WHERE user_id = %s", (user_id,)
+            )
+            result = cursor.fetchone()
+            return True if result is None else result['tag_accepted']
+    except Error:
+        logger.warning("檢查 Tag 偏好失敗", exc_info=True)
+        return True
+
 
 def get_user_mention(user: discord.Member) -> str:
     """
@@ -304,126 +276,49 @@ def get_user_mention(user: discord.Member) -> str:
     else:
         return f"@{user.display_name}"  # 返回文本名稱
 
-# --- 課表資料處理（改用 MariaDB）---
-def load_schedule():
-    """從 MariaDB 載入課表資料"""
-    connection = get_db_connection()
-    if not connection:
-        return {}
-    
-    try:
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT date, time, title, description, teacher 
-            FROM schedule 
-            ORDER BY date, time
-        """)
-        
-        rows = cursor.fetchall()
-        schedule = {}
-        
-        for row in rows:
-            # 處理日期格式
-            if hasattr(row['date'], 'strftime'):
-                date_str = row['date'].strftime("%Y-%m-%d")
-            else:
-                date_str = str(row['date'])
-            
-            if date_str not in schedule:
-                schedule[date_str] = []
-            
-            # 處理時間格式（從資料庫 HH:MM:SS 轉為 HH:MM）
-            if isinstance(row['time'], str):
-                time_str = row['time'][:5]  # 取前 5 個字符 HH:MM
-            elif hasattr(row['time'], 'strftime'):
-                time_str = row['time'].strftime("%H:%M")
-            else:
-                time_str = str(row['time'])[:5]
-            
-            schedule[date_str].append({
-                'time': time_str,
-                'title': row['title'],
-                'description': row['description'],
-                'teacher': row['teacher']
-            })
-        
-        cursor.close()
-        return schedule
-        
-    except Error as e:
-        print(f"❌ 讀取課表失敗: {e}")
-        return {}
-    finally:
-        connection.close()
-
-def save_schedule(data):
-    """將課表資料儲存到 MariaDB（新增或更新）"""
-    connection = get_db_connection()
-    if not connection:
-        print("❌ 無法連接資料庫")
-        return False
-    
-    try:
-        cursor = connection.cursor()
-        
-        for date_str, courses in data.items():
-            for course in courses:
-                # 檢查該課程是否已存在
-                check_query = """
-                    SELECT id FROM schedule 
-                    WHERE date = %s AND time = %s AND teacher = %s AND title = %s
-                """
-                cursor.execute(check_query, (
-                    date_str,
-                    course['time'],
-                    course.get('teacher', ''),
-                    course['title']
-                ))
-                
-                if cursor.fetchone():
-                    # 更新現有課程
-                    update_query = """
-                        UPDATE schedule 
-                        SET description = %s
-                        WHERE date = %s AND time = %s AND teacher = %s AND title = %s
-                    """
-                    cursor.execute(update_query, (
-                        course.get('description', ''),
-                        date_str,
-                        course['time'],
-                        course.get('teacher', ''),
-                        course['title']
-                    ))
-                else:
-                    # 插入新課程
-                    insert_query = """
-                        INSERT INTO schedule (date, time, title, description, teacher)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """
-                    cursor.execute(insert_query, (
-                        date_str,
-                        course['time'],
-                        course['title'],
-                        course.get('description', ''),
-                        course.get('teacher', '')
-                    ))
-        
-        connection.commit()
-        cursor.close()
-        return True
-        
-    except Error as e:
-        print(f"❌ 儲存課表失敗: {e}")
-        connection.rollback()
-        return False
-    finally:
-        connection.close()
-
 # --- Bot 設定 ---
+class TwilightBot(commands.Bot):
+    async def setup_hook(self):
+        # Register once per process. Each click reloads durable state from the DB.
+        self.add_view(TutoringRequestView())
+        self.add_view(CloseTutoringChannelView())
+        self.add_view(TagPreferenceView())
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = TwilightBot(command_prefix="!", intents=intents)
+
+tutoring_store = TutoringStore(get_db_connection)
+_tutoring_locks = WeakValueDictionary()
+
+
+def tutoring_lock(kind, record_id):
+    key = (kind, record_id)
+    lock = _tutoring_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _tutoring_locks[key] = lock
+    return lock
+
+
+async def tutoring_mention(user):
+    if await asyncio.to_thread(can_tag_user, user.id):
+        return user.mention
+    return f"@{user.display_name}"
+
+
+async def notify_tutoring_user(user_id, content=None, *, embed=None):
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        await user.send(content, embed=embed)
+    except discord.HTTPException:
+        logger.warning("無法發送輔導通知給使用者 %s", user_id, exc_info=True)
+
+
+class TutoringOutcomeUnknown(Exception):
+    """The DB cannot confirm whether a Discord channel was recorded."""
 
 # 追蹤斷線狀態的全局變數
 bot.disconnection_notified = False
@@ -432,378 +327,310 @@ bot.disconnection_notified = False
 
 # 1. 一對一輔導申請表單 (Modal)
 class TutoringApplyModal(ui.Modal, title="一對一輔導申請"):
-    topic = ui.TextInput(label="想請教的主題", style=discord.TextStyle.short, placeholder="例如：Python 函式庫使用", required=True)
+    topic = ui.TextInput(label="想請教的主題", style=discord.TextStyle.short, placeholder="例如：Python 函式庫使用", required=True, max_length=255)
     tutor = ui.TextInput(label="希望的鎮民 (選填)", style=discord.TextStyle.short, placeholder="請輸入鎮民的 Discord ID 或留空", required=False)
-    schedule = ui.TextInput(label="可配合的時段", style=discord.TextStyle.paragraph, placeholder="例如：平日晚上 8-10 點、週末下午", required=True)
+    schedule = ui.TextInput(label="可配合的時段", style=discord.TextStyle.paragraph, placeholder="例如：平日晚上 8-10 點、週末下午", required=True, max_length=1024)
     agreement = ui.TextInput(label="請輸入「同意」以接受錄音/陪同條款", style=discord.TextStyle.short, placeholder="同意", required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         if self.agreement.value.strip() != "同意":
             await interaction.response.send_message("您必須輸入「同意」才能提交申請。", ephemeral=True)
             return
-
-        request_channel_id = os.getenv("TUTORING_REQUEST_CHANNEL_ID")
-        if not request_channel_id:
-            await interaction.response.send_message("錯誤：未設定輔導申請頻道ID，請聯絡管理員。", ephemeral=True)
+        if interaction.guild is None:
+            await interaction.response.send_message("請在伺服器內提交輔導申請。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        request_channel = interaction.guild.get_channel(TUTORING_REQUEST_CHANNEL_ID)
+        if request_channel is None:
+            await interaction.followup.send("❌ 找不到輔導申請頻道，請聯絡管理員。", ephemeral=True)
             return
 
-        request_channel = bot.get_channel(int(request_channel_id))
-        if not request_channel:
-            await interaction.response.send_message("錯誤：找不到輔導申請頻道，請聯絡管理員。", ephemeral=True)
-            return
-
-        # 嘗試解析偏好鎮民 (可輸入昵稱或 Discord ID)
         preferred_tutor = None
-        tutor_display_text = self.tutor.value or "無指定"
-        if self.tutor.value.strip():
-            guild = interaction.guild
-            # 嘗試用 ID 查詢
-            try:
-                tutor_id = int(self.tutor.value.strip())
-                preferred_tutor = guild.get_member(tutor_id)
-            except (ValueError, AttributeError):
-                pass
-            
-            # 若 ID 查詢失敗，嘗試用昵稱查詢
-            if not preferred_tutor:
-                preferred_tutor = discord.utils.find(
-                    lambda m: m.display_name.lower() == self.tutor.value.strip().lower() or m.name.lower() == self.tutor.value.strip().lower(),
-                    guild.members
-                )
-            
-            # 若找到該鎮民，更新 display_text 為 mention
-            if preferred_tutor:
-                tutor_display_text = get_user_mention(preferred_tutor)
+        tutor_value = self.tutor.value.strip()
+        if tutor_value:
+            if tutor_value.isdigit():
+                preferred_tutor = interaction.guild.get_member(int(tutor_value))
+                if preferred_tutor is None:
+                    try:
+                        preferred_tutor = await interaction.guild.fetch_member(int(tutor_value))
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        await interaction.followup.send("❌ 無法查詢指定鎮民，請稍後重試。", ephemeral=True)
+                        return
             else:
-                tutor_display_text = self.tutor.value + " (找不到此使用者)"
+                matches = [member for member in interaction.guild.members
+                           if tutor_value.casefold() in (member.display_name.casefold(), member.name.casefold())]
+                if len(matches) == 1:
+                    preferred_tutor = matches[0]
+            if preferred_tutor is None:
+                await interaction.followup.send("❌ 找不到唯一的指定鎮民，請改用 Discord ID，或留空讓其他鎮民接單。", ephemeral=True)
+                return
+            if preferred_tutor.id == interaction.user.id or not any(role.name == '鎮民' for role in preferred_tutor.roles):
+                await interaction.followup.send("❌ 請指定自己以外、具有鎮民身分的導師。", ephemeral=True)
+                return
 
-        embed = discord.Embed(
-            title="新的輔導申請",
-            description=f"申請人：{get_user_mention(interaction.user)}",
-            color=discord.Color.blue()
-        )
+        applicant_mention = await tutoring_mention(interaction.user)
+        tutor_display = await tutoring_mention(preferred_tutor) if preferred_tutor else "無指定"
+        embed = discord.Embed(title="新的輔導申請", description=f"申請人：{applicant_mention}", color=discord.Color.blue())
         embed.add_field(name="主題", value=self.topic.value, inline=False)
-        embed.add_field(name="偏好鎮民", value=tutor_display_text, inline=False)
+        embed.add_field(name="偏好鎮民", value=tutor_display, inline=False)
         embed.add_field(name="可配合時段", value=self.schedule.value, inline=False)
         embed.set_footer(text=f"申請人 ID: {interaction.user.id} | ⏰ 24 小時內回應")
 
-        # 將申請存入資料庫
-        connection = get_db_connection()
-        if not connection:
-            await interaction.response.send_message("❌ 無法連接資料庫，請稍後重試。", ephemeral=True)
-            return
-
         request_id = None
+        message = None
+        published = False
         try:
-            cursor = connection.cursor()
-            
-            # 存入資料庫
-            insert_query = """
-                INSERT INTO tutoring_requests 
-                (applicant_id, applicant_name, topic, preferred_tutor_id, preferred_tutor_name, schedule, created_at, status, message_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            preferred_tutor_id = preferred_tutor.id if preferred_tutor else None
-            preferred_tutor_name = preferred_tutor.display_name if preferred_tutor else None
-            
-            cursor.execute(insert_query, (
-                interaction.user.id,
-                interaction.user.display_name,
-                self.topic.value,
-                preferred_tutor_id,
-                preferred_tutor_name,
-                self.schedule.value,
-                datetime.now(),
-                'pending',
-                None  # message_id 將在下方更新
-            ))
-            connection.commit()
-            request_id = cursor.lastrowid
-            cursor.close()
-        except Error as e:
-            print(f"❌ 存入輔導申請失敗: {e}")
-            await interaction.response.send_message(f"❌ 存入資料庫失敗：{str(e)}", ephemeral=True)
-            connection.close()
+            request_id = await asyncio.to_thread(tutoring_store.create_request, interaction.user, self.topic.value, preferred_tutor, self.schedule.value)
+            # Publish buttons only after the message ID is durable.
+            message = await request_channel.send(embed=embed)
+            try:
+                await asyncio.to_thread(tutoring_store.attach_message, request_id, message.id)
+            except Error:
+                # A commit may succeed even when its response is lost. Do not
+                # delete the message until a fresh read confirms the outcome.
+                try:
+                    recorded = await asyncio.to_thread(tutoring_store.get_request, message.id)
+                except Error:
+                    await interaction.followup.send(
+                        "⚠️ 無法確認申請結果，請聯絡管理員核對，暫勿重複提交。", ephemeral=True
+                    )
+                    logger.exception("無法確認申請 %s 的訊息是否已記錄", request_id)
+                    return
+                if recorded is None:
+                    raise
+            published = True
+            await message.edit(view=TutoringRequestView())
+        except (Error, discord.HTTPException):
+            logger.exception("發布輔導申請失敗 (request_id=%s)", request_id)
+            if published:
+                # The request is durable; an administrator can restore the buttons.
+                await interaction.followup.send("⚠️ 申請已記錄，但按鈕顯示失敗；請聯絡管理員，無須重複提交。", ephemeral=True)
+                return
+            if message is not None:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    logger.exception("無法移除未發布的輔導訊息 %s", message.id)
+            if request_id is not None:
+                try:
+                    await asyncio.to_thread(tutoring_store.discard_unpublished_request, request_id)
+                except Error:
+                    logger.exception("無法清理未發布的申請 %s", request_id)
+            await interaction.followup.send("❌ 申請未完成，請稍後重試；若頻道留有無按鈕訊息，請通知管理員。", ephemeral=True)
             return
 
-        view = TutoringRequestView(applicant=interaction.user, created_at=datetime.utcnow(), preferred_tutor=preferred_tutor, request_id=request_id)
-        message = await request_channel.send(embed=embed, view=view)
-        
-        # 更新資料庫中的 message_id
-        try:
-            cursor = connection.cursor()
-            cursor.execute("UPDATE tutoring_requests SET message_id = %s WHERE id = %s", (message.id, request_id))
-            connection.commit()
-            cursor.close()
-        except Error as e:
-            print(f"❌ 更新 message_id 失敗: {e}")
-        finally:
-            connection.close()
-        await request_channel.send(embed=embed, view=view)
-        
-        # 若有指定偏好鎮民，發送一條 tag 訊息
+        await interaction.followup.send("您的輔導申請已成功送出，請靜候回覆。", ephemeral=True)
         if preferred_tutor:
-            await request_channel.send(f"📢 {get_user_mention(preferred_tutor)}，有一則輔導申請指定了您！")
-        
-        await interaction.response.send_message("您的輔導申請已成功送出，請靜候回覆。", ephemeral=True)
-        log_msg = f"✅ 使用者 {interaction.user.name} (ID: {interaction.user.id}) 提交了輔導申請，偏好鎮民：{preferred_tutor.display_name if preferred_tutor else '無指定'}，期望學習主題：{self.topic.value}"
-        await send_log(log_msg, "SUCCESS")
-        print(log_msg)
+            try:
+                await request_channel.send(f"📢 {tutor_display}，有一則輔導申請指定了您！")
+            except discord.HTTPException:
+                logger.warning("輔導申請 %s 的指定導師通知失敗", request_id, exc_info=True)
+        await send_log(f"✅ 使用者 {interaction.user.name} (ID: {interaction.user.id}) 提交輔導申請 (ID: {request_id})", "SUCCESS")
 
-# 1a. 輔導頻道關閉按鈕 (View)
+
 class CloseTutoringChannelView(ui.View):
-    def __init__(self, tutor: discord.Member, applicant: discord.Member):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.tutor = tutor
-        self.applicant = applicant
 
     @ui.button(label="🔒 關閉輔導", style=discord.ButtonStyle.danger, custom_id="close_tutoring_channel")
     async def close_channel(self, interaction: discord.Interaction, button: ui.Button):
-        # 若 tutor 或 applicant 為 None，表示是機器人啟動時的佔位符，直接返回
-        if self.tutor is None or self.applicant is None:
-            await interaction.response.send_message("❌ 此按鈕已過期，請聯絡管理員。", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild is None:
+            await interaction.followup.send("❌ 請在輔導頻道使用此按鈕。", ephemeral=True)
             return
-        
-        # 只允許導師或申請人關閉頻道
-        if interaction.user not in (self.tutor, self.applicant):
-            await interaction.response.send_message("❌ 只有申請人可以關閉此頻道。", ephemeral=True)
-            return
-
-        # 取得指定類別（關閉頻道存放區）
-        channel = interaction.channel
-        guild = channel.guild
-        
-        archive_category = guild.get_channel(TUTORING_ARCHIVE_CATEGORY_ID)
-        
-        if archive_category is None or not isinstance(archive_category, discord.CategoryChannel):
-            await interaction.response.send_message("❌ 找不到頻道存放區類別，請聯絡管理員。", ephemeral=True)
-            return
-
-        # 將頻道移到存放區類別（會自動加上「已關閉-」前綴以示區別）
-        old_name = channel.name
-        new_name = f"已關閉-{old_name}" if not old_name.startswith("已關閉-") else old_name
-        await channel.edit(category=archive_category, name=new_name)
-
-        # 更新資料庫：記錄關閉時間和狀態
-        try:
-            connection = get_db_connection()
-            if connection:
-                cursor = connection.cursor()
-                update_query = """
-                    UPDATE tutoring_channels 
-                    SET closed_at = NOW(), status = %s 
-                    WHERE channel_id = %s
-                """
-                cursor.execute(update_query, ('closed', channel.id))
-                connection.commit()
-                cursor.close()
-                connection.close()
-        except Error as e:
-            print(f"❌ 更新關閉時間失敗: {e}")
-
-        # 鎖定頻道：禁止所有人（除管理員）傳送訊息
-        await channel.set_permissions(
-            guild.default_role,
-            read_messages=False,
-            send_messages=False
-        )
-        
-        # 保證申請人和導師只能查看但不能發言
-        await channel.set_permissions(
-            self.applicant,
-            read_messages=True,
-            send_messages=False
-        )
-        await channel.set_permissions(
-            self.tutor,
-            read_messages=True,
-            send_messages=False
-        )
-
-        # 允許管理員查看和發言
-        admin_role = discord.utils.find(lambda r: r.permissions.administrator, guild.roles)
-        if admin_role:
-            await channel.set_permissions(
-                admin_role,
-                read_messages=True,
-                send_messages=True
-            )
-
-        # 停用按鈕
-        self.clear_items()
-        await interaction.response.defer()
-        
-        # 發送通知訊息
-        embed = discord.Embed(
-            title="📋 輔導已結束",
-            description=f"此輔導頻道已於 {interaction.created_at.strftime('%Y-%m-%d %H:%M')} 關閉。\n"
-                        "頻道將保留作為存證記錄，僅管理員可以查看和編輯。",
-            color=discord.Color.greyple()
-        )
-        await channel.send(embed=embed, view=self)
-        log_msg = f"✅ 輔導頻道 {channel.name} 已由 {interaction.user.name} (ID: {interaction.user.id}) 關閉並移至已關閉輔導資料夾。"
-        await send_log(log_msg, "SUCCESS")
-        print(log_msg)
+        async with tutoring_lock('channel', interaction.channel_id):
+            try:
+                record = await asyncio.to_thread(tutoring_store.get_channel, interaction.channel_id)
+                if record is None or interaction.user.id not in (record['applicant_id'], record['tutor_id']):
+                    await interaction.followup.send("❌ 只有該輔導的申請人或導師可以關閉頻道。", ephemeral=True)
+                    return
+                if record['status'] != 'active':
+                    try:
+                        await interaction.message.edit(view=None)
+                    except discord.HTTPException:
+                        pass
+                    await interaction.followup.send("ℹ️ 此輔導已關閉。", ephemeral=True)
+                    return
+                channel = interaction.channel
+                archive_category = interaction.guild.get_channel(TUTORING_ARCHIVE_CATEGORY_ID)
+                if not isinstance(archive_category, discord.CategoryChannel):
+                    await interaction.followup.send("❌ 找不到頻道存放區類別，請聯絡管理員。", ephemeral=True)
+                    return
+                # Apply permissions and category in one Discord operation. Keep the
+                # bot writable so it can finish posting the archive confirmation.
+                overwrites = channel.overwrites
+                overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(view_channel=False, send_messages=False)
+                for user_id in (record['applicant_id'], record['tutor_id']):
+                    member = interaction.guild.get_member(user_id)
+                    target = member or discord.Object(id=user_id, type=discord.Member)
+                    overwrite = overwrites.get(target, discord.PermissionOverwrite())
+                    overwrite.view_channel = True
+                    overwrite.send_messages = False
+                    overwrites[target] = overwrite
+                overwrites[interaction.guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+                new_name = channel.name if channel.name.startswith("已關閉-") else f"已關閉-{channel.name}"
+                await channel.edit(category=archive_category, name=new_name[:100], overwrites=overwrites, sync_permissions=False)
+                try:
+                    await asyncio.to_thread(tutoring_store.close_channel, channel.id)
+                except Error:
+                    # A lost commit response may still have persisted the close.
+                    confirmed = await asyncio.to_thread(tutoring_store.get_channel, channel.id)
+                    if confirmed is None or confirmed['status'] != 'closed':
+                        raise
+            except (Error, discord.HTTPException):
+                logger.exception("關閉輔導頻道失敗 %s", interaction.channel_id)
+                await interaction.followup.send("❌ 關閉未完成，請重試或聯絡管理員。", ephemeral=True)
+                return
+            try:
+                await interaction.message.edit(view=None)
+                await channel.send(embed=discord.Embed(title="📋 輔導已結束", description="此頻道已封存。申請人與導師可查看紀錄，無法繼續發言。", color=discord.Color.greyple()))
+            except discord.HTTPException:
+                logger.warning("輔導已關閉，但封存通知未完成 %s", channel.id, exc_info=True)
+            await interaction.followup.send("✅ 輔導已關閉並封存。", ephemeral=True)
+            await send_log(f"✅ 輔導頻道 {channel.id} 已由 {interaction.user.id} 關閉。", "SUCCESS")
 
 
-# 1b. 輔導申請的按鈕 (View)
 class TutoringRequestView(ui.View):
-    def __init__(self, applicant: discord.Member, created_at: datetime, preferred_tutor: Optional[discord.Member] = None, request_id: int = None):
-        super().__init__(timeout=None)  # 設為 None 讓 view 永久有效，時間檢查在 interaction_check 中進行
-        self.applicant = applicant
-        self.created_at = created_at
-        self.preferred_tutor = preferred_tutor  # 新增：偏好導師
-        self.request_id = request_id  # 新增：資料庫申請 ID
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """檢查時間限制與按鈕權限"""
-        # 若 applicant 為 None（機器人剛啟動時的佔位符），允許交互通過
-        if self.applicant is None:
-            return True
-        
-        # 檢查是否超過 24 小時
-        if datetime.utcnow() - self.created_at > timedelta(seconds=TUTORING_REQUEST_TIMEOUT):
-            await interaction.response.send_message(
-                "❌ 此申請已超過 24 小時回應期限，請要求申請人重新提交申請。",
-                ephemeral=True
-            )
-            return False
+    async def _get_actionable_request(self, interaction):
+        if interaction.guild is None or interaction.channel_id != TUTORING_REQUEST_CHANNEL_ID:
+            await interaction.followup.send("❌ 請在輔導申請頻道操作。", ephemeral=True)
+            return None
+        request = await asyncio.to_thread(tutoring_store.get_request, interaction.message.id)
+        if request is None:
+            await interaction.followup.send("❌ 找不到此申請紀錄，請聯絡管理員。", ephemeral=True)
+            return None
+        if request['status'] != 'pending' or request['expired']:
+            await interaction.followup.send("ℹ️ 此申請已處理或超過 24 小時期限。", ephemeral=True)
+            return None
+        if interaction.user.id == request['applicant_id'] or not any(role.name == '鎮民' for role in interaction.user.roles):
+            await interaction.followup.send("❌ 只有申請人以外、具有鎮民身分的導師可以處理申請。", ephemeral=True)
+            return None
+        if request['preferred_tutor_id'] and interaction.user.id != request['preferred_tutor_id']:
+            await interaction.followup.send("❌ 只有指定的鎮民可以接受或婉拒此申請。", ephemeral=True)
+            return None
+        return request
 
-        # 檢查按鈕權限：如果指定了偏好導師，只有該導師可操作；否則任何導師都可
-        if self.preferred_tutor:
-            if interaction.user != self.preferred_tutor:
-                await interaction.response.send_message(
-                    f"❌ 只有 {get_user_mention(self.preferred_tutor)} 可以接受或婉拒此申請。",
-                    ephemeral=True
-                )
-                return False
-        
-        return True
+    async def _mark_message(self, interaction, text, color):
+        embed = interaction.message.embeds[0].copy() if interaction.message.embeds else discord.Embed(title="輔導申請")
+        embed.description = text
+        embed.color = color
+        try:
+            await interaction.message.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            # Durable status prevents another action even if Discord cannot edit.
+            logger.warning("無法更新輔導訊息 %s", interaction.message.id, exc_info=True)
 
     @ui.button(label="✅ 接單", style=discord.ButtonStyle.success, custom_id="accept_tutoring")
     async def accept(self, interaction: discord.Interaction, button: ui.Button):
-        # 若 applicant 為 None，表示是機器人啟動時的佔位符
-        if self.applicant is None:
-            await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
-            return
-        
-        # 更新資料庫狀態
-        if self.request_id:
-            connection = get_db_connection()
-            if connection:
-                try:
-                    cursor = connection.cursor()
-                    cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('accepted', self.request_id))
-                    connection.commit()
-                    cursor.close()
-                except Error as e:
-                    print(f"❌ 更新申請狀態失敗: {e}")
-                finally:
-                    connection.close()
-        
-        tutor = interaction.user
-        guild = interaction.guild
-        
-        # 取得指定類別（輔導頻道專用）
-        tutoring_category = guild.get_channel(TUTORING_CATEGORY_ID)
-        
-        if tutoring_category is None or not isinstance(tutoring_category, discord.CategoryChannel):
-            await interaction.response.send_message("❌ 找不到輔導頻道類別，請聯絡管理員。", ephemeral=True)
-            return
-        
-        # 建立臨時私人頻道（在指定類別中）
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            self.applicant: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            tutor: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-        }
-        channel_name = f"輔導-{self.applicant.name}-{tutor.name}"
-        temp_channel = await interaction.guild.create_text_channel(channel_name, overwrites=overwrites, category=tutoring_category)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with tutoring_lock('request', interaction.message.id):
+            temp_channel = None
+            try:
+                request = await self._get_actionable_request(interaction)
+                if request is None:
+                    return
+                guild = interaction.guild
+                category = guild.get_channel(TUTORING_CATEGORY_ID)
+                if not isinstance(category, discord.CategoryChannel):
+                    await interaction.followup.send("❌ 找不到輔導頻道類別，請聯絡管理員。", ephemeral=True)
+                    return
+                applicant = guild.get_member(request['applicant_id'])
+                if applicant is None:
+                    try:
+                        applicant = await guild.fetch_member(request['applicant_id'])
+                    except discord.NotFound:
+                        await interaction.followup.send("❌ 申請人已離開伺服器，無法接受此輔導申請。", ephemeral=True)
+                        return
+                tutor = interaction.user
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    applicant: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                    tutor: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                    guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                }
+                temp_channel = await guild.create_text_channel(f"輔導-{applicant.name}-{tutor.name}"[:100], overwrites=overwrites, category=category)
+                # Include the close control before committing success. If posting
+                # fails, the channel is removed and the request stays pending.
+                applicant_mention, tutor_mention = await asyncio.gather(tutoring_mention(applicant), tutoring_mention(tutor))
+                await temp_channel.send(
+                    f"歡迎 {applicant_mention} 與 {tutor_mention}！\n這裡是你們的專屬討論區。\n\n"
+                    "**提醒**：輔導結束後，請在此頻道簡要回報討論摘要與花費時間，以作為平台存證。",
+                    view=CloseTutoringChannelView(),
+                )
+                completed = await self._record_acceptance(request, temp_channel, applicant, tutor)
+                if not completed:
+                    await self._remove_uncommitted_channel(temp_channel)
+                    await interaction.followup.send("ℹ️ 此申請已處理或過期，未建立新的輔導。", ephemeral=True)
+                    return
+            except TutoringOutcomeUnknown:
+                logger.exception("接單提交結果無法確認，保留頻道 %s 供管理員核對", temp_channel.id)
+                await interaction.followup.send("⚠️ 頻道已建立，但無法確認資料庫結果；請聯絡管理員核對，暫勿重複操作。", ephemeral=True)
+                return
+            except (Error, discord.HTTPException):
+                logger.exception("接受輔導申請失敗 (message_id=%s)", interaction.message.id)
+                if temp_channel is not None:
+                    await self._remove_uncommitted_channel(temp_channel)
+                await interaction.followup.send("❌ 接單未完成，請重試；若出現殘留頻道，請通知管理員。", ephemeral=True)
+                return
+            await self._mark_message(interaction, f"申請人：{applicant_mention}\n**由 {tutor_mention} 已接單**", discord.Color.green())
+            await interaction.followup.send(f"✅ 已接受輔導申請，請至 {temp_channel.mention}。", ephemeral=True)
+            await notify_tutoring_user(applicant.id, f"好消息！您的輔導申請已被 {tutor_mention} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
+            await send_log(f"✅ 導師 {tutor.id} 接受申請 {request['id']}，已建立頻道 {temp_channel.id}。", "SUCCESS")
 
-        # 將頻道記錄存入資料庫
+    async def _record_acceptance(self, request, channel, applicant, tutor):
         try:
-            connection = get_db_connection()
-            if connection:
-                cursor = connection.cursor()
-                insert_query = """
-                    INSERT INTO tutoring_channels 
-                    (channel_id, channel_name, applicant_id, applicant_name, tutor_id, tutor_name, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """
-                cursor.execute(insert_query, (
-                    temp_channel.id,
-                    channel_name,
-                    self.applicant.id,
-                    self.applicant.display_name,
-                    tutor.id,
-                    tutor.display_name,
-                    'active'
-                ))
-                connection.commit()
-                cursor.close()
-                connection.close()
-        except Error as e:
-            print(f"❌ 頻道記錄存入失敗: {e}")
+            return await asyncio.to_thread(
+                tutoring_store.finish_request, request['id'], 'accepted',
+                (channel.id, channel.name, applicant.id, applicant.display_name, tutor.id, tutor.display_name),
+            )
+        except Error as commit_error:
+            # A dropped commit response can still mean success on the server.
+            # Confirm on a fresh connection before deleting a recorded channel.
+            try:
+                recorded = await asyncio.to_thread(tutoring_store.get_channel, channel.id)
+            except Error as lookup_error:
+                raise TutoringOutcomeUnknown() from lookup_error
+            if recorded is not None:
+                return True
+            raise commit_error
 
-        # 停用原始訊息的按鈕
-        self.clear_items()
-        original_message = interaction.message
-        edited_embed = original_message.embeds[0]
-        edited_embed.description = f"申請人：{get_user_mention(self.applicant)}\n**由 {get_user_mention(tutor)} 已接單**"
-        edited_embed.color = discord.Color.green()
-        await original_message.edit(embed=edited_embed, view=self)
-
-        # 通知雙方
-        await interaction.response.send_message(f"您已接受 {get_user_mention(self.applicant)} 的輔導申請。", ephemeral=True)
-        await self.applicant.send(f"好消息！您的輔導申請已被 {get_user_mention(tutor)} 接受。\n請至頻道 {temp_channel.mention} 開始討論。")
-        
-        # 4. 自動化記錄與提醒
-        close_view = CloseTutoringChannelView(tutor=tutor, applicant=self.applicant)
-        await temp_channel.send(
-            f"歡迎 {get_user_mention(self.applicant)} 與 {get_user_mention(tutor)}！\n"
-            f"這裡是你們的專屬討論區。\n\n"
-            f"**提醒**：輔導結束後，請記得在此頻道簡要回報紀錄（例如：討論摘要、花費時間），以作為平台存證，感謝！",
-            view=close_view
-        )
-        log_msg = f"✅ {tutor.name} (ID: {tutor.id}) 接受了 {self.applicant.name} (ID: {self.applicant.id}) 的申請，已建立頻道 {channel_name}。"
-        await send_log(log_msg, "SUCCESS")
-        print(log_msg)
-
+    async def _remove_uncommitted_channel(self, channel):
+        try:
+            await channel.delete(reason="輔導接單未完成，清理未記錄頻道")
+        except discord.HTTPException:
+            logger.exception("需要管理員清理未完成的輔導頻道 %s", channel.id)
 
     @ui.button(label="❌ 婉拒", style=discord.ButtonStyle.danger, custom_id="decline_tutoring")
     async def decline(self, interaction: discord.Interaction, button: ui.Button):
-        # 若 applicant 為 None，表示是機器人啟動時的佔位符
-        if self.applicant is None:
-            await interaction.response.send_message("❌ 此申請已過期或無效，請聯絡管理員。", ephemeral=True)
-            return
-        
-        # 更新資料庫狀態
-        if self.request_id:
-            connection = get_db_connection()
-            if connection:
-                try:
-                    cursor = connection.cursor()
-                    cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('declined', self.request_id))
-                    connection.commit()
-                    cursor.close()
-                except Error as e:
-                    print(f"❌ 更新申請狀態失敗: {e}")
-                finally:
-                    connection.close()
-        
-        self.clear_items()
-        original_message = interaction.message
-        edited_embed = original_message.embeds[0]
-        edited_embed.description = f"申請人：{get_user_mention(self.applicant)}\n**由 {get_user_mention(interaction.user)} 已婉拒**"
-        edited_embed.color = discord.Color.red()
-        await original_message.edit(embed=edited_embed, view=self)
-
-        await interaction.response.send_message(f"您已婉拒此申請。", ephemeral=True)
-        await self.applicant.send(f"很遺憾，您的輔導申請已被婉拒。若有疑問請聯繫管理員。")
-        log_msg = f"❌ {interaction.user.name} (ID: {interaction.user.id}) 婉拒了 {self.applicant.name} (ID: {self.applicant.id}) 的申請。"
-        await send_log(log_msg, "SUCCESS")
-        print(log_msg)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with tutoring_lock('request', interaction.message.id):
+            try:
+                request = await self._get_actionable_request(interaction)
+                if request is None:
+                    return
+                completed = await asyncio.to_thread(tutoring_store.finish_request, request['id'], 'declined')
+            except Error:
+                logger.exception("婉拒輔導申請失敗 %s", interaction.message.id)
+                await interaction.followup.send("❌ 處理失敗，請稍後重試。", ephemeral=True)
+                return
+            if not completed:
+                await interaction.followup.send("ℹ️ 此申請已處理或過期。", ephemeral=True)
+                return
+            description = interaction.message.embeds[0].description if interaction.message.embeds else None
+            applicant_line = next((line for line in (description or '').splitlines() if line.startswith('申請人：')), None)
+            if applicant_line is None:
+                applicant = interaction.guild.get_member(request['applicant_id'])
+                applicant_display = await tutoring_mention(applicant) if applicant else '（已離開伺服器）'
+                applicant_line = f"申請人：{applicant_display}"
+            await self._mark_message(interaction, f"{applicant_line}\n**此申請已婉拒**", discord.Color.red())
+            await interaction.followup.send("✅ 已婉拒此申請。", ephemeral=True)
+            await notify_tutoring_user(request['applicant_id'], "很遺憾，您的輔導申請已被婉拒。若有疑問請聯繫管理員。")
+            await send_log(f"ℹ️ 導師 {interaction.user.id} 婉拒申請 {request['id']}。", "INFO")
 
 # 2. 站務申請系統流程
 # 2.1 申請類型選擇 Select 菜單
@@ -851,14 +678,16 @@ class IdentityChangeModal(ui.Modal):
         self.discord_id_input = ui.TextInput(
             label="Discord ID",
             placeholder="輸入您的 Discord ID（右鍵複製個人資料中的ID）",
-            required=True
+            required=True,
+            max_length=1024
         )
         self.add_item(self.discord_id_input)
 
         self.age_confirm_input = ui.TextInput(
             label="確認聲明（請輸入「我確認已年滿 18 歲」以表同意）",
             placeholder="我確認已年滿 18 歲，並理解若虛假申報，將永久失去微光鎮參與資格。",
-            required=True
+            required=True,
+            max_length=1024
         )
         self.add_item(self.age_confirm_input)
 
@@ -888,7 +717,8 @@ class PermissionChangeModal(ui.Modal):
         self.discord_id_input = ui.TextInput(
             label="Discord ID",
             placeholder="輸入您的 Discord ID",
-            required=True
+            required=True,
+            max_length=1024
         )
         self.add_item(self.discord_id_input)
 
@@ -897,7 +727,7 @@ class PermissionChangeModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="請詳細說明需要權限異動的原因...",
             required=True,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.reason_input)
 
@@ -919,7 +749,8 @@ class TechIssueModal(ui.Modal):
         self.discord_id_input = ui.TextInput(
             label="Discord ID (選填)",
             placeholder="輸入您的 Discord ID（若想匿名則可不填）",
-            required=False
+            required=False,
+            max_length=1024
         )
         self.add_item(self.discord_id_input)
 
@@ -928,16 +759,16 @@ class TechIssueModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="請詳細描述遇到的技術或制度問題...",
             required=True,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.issue_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         app_data = {
             "type": "tech_issue",
-            "discord_id": self.discord_id_input.value or "匿名",
+            "discord_id": self.discord_id_input.value.strip() or "匿名",
             "issue": self.issue_input.value,
-            "is_anonymous": False
+            "is_anonymous": not self.discord_id_input.value.strip() or self.discord_id_input.value.strip() == "匿名"
         }
         
         await dispatch_official_application(interaction, app_data)
@@ -950,7 +781,8 @@ class VolunteerContactModal(ui.Modal):
         self.discord_id_input = ui.TextInput(
             label="Discord ID (選填)",
             placeholder="輸入您的 Discord ID（若想匿名則可不填）",
-            required=False
+            required=False,
+            max_length=1024
         )
         self.add_item(self.discord_id_input)
 
@@ -959,7 +791,7 @@ class VolunteerContactModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="請放上企畫內容、推廣理由、想合作的內容、時間長短等詳細資訊...",
             required=True,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.content_input)
 
@@ -968,17 +800,17 @@ class VolunteerContactModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="可貼上相關文件的超連結...",
             required=False,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.document_link_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         app_data = {
             "type": "volunteer_contact",
-            "discord_id": self.discord_id_input.value or "匿名",
+            "discord_id": self.discord_id_input.value.strip() or "匿名",
             "content": self.content_input.value,
             "document_link": self.document_link_input.value,
-            "is_anonymous": False
+            "is_anonymous": not self.discord_id_input.value.strip() or self.discord_id_input.value.strip() == "匿名"
         }
         
         await dispatch_official_application(interaction, app_data)
@@ -991,7 +823,8 @@ class AnonymousReportModal(ui.Modal):
         self.target_user_input = ui.TextInput(
             label="檢舉對象的使用者名稱或ID",
             placeholder="請輸入對方的暱稱或 Discord ID",
-            required=True
+            required=True,
+            max_length=1024
         )
         self.add_item(self.target_user_input)
 
@@ -1000,7 +833,7 @@ class AnonymousReportModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="請詳細說明事發經過...",
             required=True,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.reason_input)
 
@@ -1009,7 +842,7 @@ class AnonymousReportModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="可貼上圖片連結、訊息連結或補充資訊",
             required=False,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.additional_context_input)
 
@@ -1039,7 +872,7 @@ class AttachmentUploadModal(ui.Modal):
             style=discord.TextStyle.paragraph,
             placeholder="請說明這些附件代表的內容\n附件說明的內容可不打，提交後機器人會私訊您，請在私訊框中提交附件",
             required=False,
-            max_length=1900
+            max_length=1024
         )
         self.add_item(self.note_input)
 
@@ -1057,7 +890,7 @@ class AttachmentUploadModal(ui.Modal):
                 "請一次上傳完畢所有附件，並在同一則訊息中傳送。\n"
                 "如檔案太多請分兩次檢舉"
             )
-        except discord.Forbidden:
+        except discord.HTTPException:
             await interaction.followup.send(
                 "❌ 無法傳送私訊給您。請先開啟伺服器中其他成員的 DM，或檢查隱私設定。",
                 ephemeral=True
@@ -1072,8 +905,11 @@ class AttachmentUploadModal(ui.Modal):
         try:
             message = await bot.wait_for("message", check=check, timeout=600)
             attachments = message.attachments
-        except:
-            await dm_channel.send("⏱️ 上傳超時，檢舉已取消。若需重新檢舉請使用 `/report` 指令。")
+        except asyncio.TimeoutError:
+            try:
+                await dm_channel.send("⏱️ 上傳超時，檢舉已取消。若需重新檢舉請使用 `/apply` → 匿名檢舉。")
+            except discord.HTTPException:
+                logger.warning("無法發送附件上傳逾時通知", exc_info=True)
             await interaction.followup.send("⏱️ 上傳超時，已取消檢舉。", ephemeral=True)
             return
 
@@ -1092,7 +928,10 @@ class AttachmentUploadModal(ui.Modal):
             attachments=list(attachments)
         )
         
-        await dm_channel.send("✅ 您的檢舉已送出，感謝您的回報！")
+        try:
+            await dm_channel.send("✅ 您的檢舉已送出，感謝您的回報！")
+        except discord.HTTPException:
+            logger.warning("無法發送檢舉提交私訊確認", exc_info=True)
 
 
 
@@ -1112,19 +951,24 @@ async def get_user_display_name(bot: discord.Client, user_id_str: str) -> str:
         return f"ID: {user_id_str}"
 
 
+def embed_field_value(value):
+    return str(value or "無提供")[:1024]
+
+
 async def dispatch_official_application(
     interaction: discord.Interaction,
     app_data: dict
 ) -> None:
     """將站務申請送至管理員頻道。根據申請類型顯示不同的 Embed。"""
-    admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    admin_channel_id = ADMIN_CHANNEL_ID
     if not admin_channel_id:
-        await interaction.response.send_message("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
+        await interaction.followup.send("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
         return
 
     admin_channel = bot.get_channel(int(admin_channel_id))
     if not admin_channel:
-        await interaction.response.send_message("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
+        await interaction.followup.send("錯誤：找不到管理員頻道，請聯絡管理員。", ephemeral=True)
         return
 
     app_type = app_data.get("type")
@@ -1139,7 +983,7 @@ async def dispatch_official_application(
             title="🆔 身分轉換申請",
             color=discord.Color.blurple()
         )
-        embed.add_field(name="申請人", value=discord_id_display, inline=False)
+        embed.add_field(name="申請人", value=embed_field_value(discord_id_display), inline=False)
         embed.add_field(name="申請事由", value="年齡身分轉換（未成年 → 已滿 18）", inline=False)
         embed.add_field(name="聲明", value="申請人已確認聲明內容", inline=False)
         
@@ -1148,8 +992,8 @@ async def dispatch_official_application(
             title="🔐 權限異動申請",
             color=discord.Color.green()
         )
-        embed.add_field(name="申請人", value=discord_id_display, inline=False)
-        embed.add_field(name="申請原因", value=app_data.get("reason"), inline=False)
+        embed.add_field(name="申請人", value=embed_field_value(discord_id_display), inline=False)
+        embed.add_field(name="申請原因", value=embed_field_value(app_data.get("reason")), inline=False)
         
     elif app_type == "tech_issue":
         embed = discord.Embed(
@@ -1158,8 +1002,8 @@ async def dispatch_official_application(
         )
         # 如果有 discord_id 且不是空字符串，顯示用戶名稱
         if app_data.get("discord_id"):
-            embed.add_field(name="回報人", value=discord_id_display, inline=False)
-        embed.add_field(name="問題說明", value=app_data.get("issue"), inline=False)
+            embed.add_field(name="回報人", value=embed_field_value(discord_id_display), inline=False)
+        embed.add_field(name="問題說明", value=embed_field_value(app_data.get("issue")), inline=False)
         
     elif app_type == "volunteer_contact":
         embed = discord.Embed(
@@ -1168,10 +1012,10 @@ async def dispatch_official_application(
         )
         # 如果有 discord_id 且不是空字符串，顯示用戶名稱
         if app_data.get("discord_id"):
-            embed.add_field(name="聯繫人", value=discord_id_display, inline=False)
-        embed.add_field(name="企畫內容與說明", value=app_data.get("content"), inline=False)
+            embed.add_field(name="聯繫人", value=embed_field_value(discord_id_display), inline=False)
+        embed.add_field(name="企畫內容與說明", value=embed_field_value(app_data.get("content")), inline=False)
         if app_data.get("document_link"):
-            embed.add_field(name="文件超連結", value=app_data.get("document_link"), inline=False)
+            embed.add_field(name="文件超連結", value=embed_field_value(app_data.get("document_link")), inline=False)
     
     else:
         # 不應該執行到這裡，但為了安全起見
@@ -1187,7 +1031,7 @@ async def dispatch_official_application(
     embed.timestamp = datetime.now(timezone.utc)
 
     await admin_channel.send(embed=embed)
-    await interaction.response.send_message("✅ 您的申請已成功提交，感謝您的支持！", ephemeral=True)
+    await interaction.followup.send("✅ 您的申請已成功提交，感謝您的支持！", ephemeral=True)
     log_msg = f"✅ 收到一則站務申請：{app_type}，提交方式：{'匿名' if is_anonymous else '非匿名'}，提交人：{discord_id_display}"
     await send_log(log_msg, "SUCCESS")
     print(log_msg)
@@ -1201,7 +1045,7 @@ async def dispatch_anonymous_report(
     attachments: Optional[List[discord.Attachment]] = None
 ) -> None:
     """將匿名檢舉送至管理員頻道，並處理附件下載。"""
-    admin_channel_id = os.getenv("ADMIN_CHANNEL_ID")
+    admin_channel_id = ADMIN_CHANNEL_ID
     if not admin_channel_id:
         await interaction.followup.send("錯誤：未設定管理員頻道ID，請聯絡管理員。", ephemeral=True)
         return
@@ -1218,8 +1062,8 @@ async def dispatch_anonymous_report(
         title="⚠️ 收到新的匿名檢舉",
         color=discord.Color.orange()
     )
-    embed.add_field(name="檢舉對象", value=target_user_display, inline=False)
-    embed.add_field(name="事由", value=reason, inline=False)
+    embed.add_field(name="檢舉對象", value=embed_field_value(target_user_display), inline=False)
+    embed.add_field(name="事由", value=embed_field_value(reason), inline=False)
 
     evidence_lines = []
     if additional_context:
@@ -1227,7 +1071,7 @@ async def dispatch_anonymous_report(
     if attachments:
         evidence_lines.append(f"附件數量：{len(attachments)}")
 
-    embed.add_field(name="證據/補充", value="\n".join(evidence_lines) if evidence_lines else "無提供", inline=False)
+    embed.add_field(name="證據/補充", value=embed_field_value("\n".join(evidence_lines) if evidence_lines else "無提供"), inline=False)
     embed.set_footer(text="此為匿名檢舉，請管理員謹慎處理。")
 
     files_to_forward = []
@@ -1257,10 +1101,6 @@ async def on_ready():
     print(f'Logged in as {bot.user.name}')
     activity = discord.Activity(name="烤羊羊", type=discord.ActivityType.playing, start=datetime.now())
     await bot.change_presence(activity=activity)
-    # 重新註冊 view 以支援機器人重啟後的舊按鈕交互
-    bot.add_view(TutoringRequestView(applicant=None, created_at=datetime.utcnow(), preferred_tutor=None))
-    bot.add_view(CloseTutoringChannelView(tutor=None, applicant=None))
-    bot.add_view(TagPreferenceView())  # 註冊 Tag 偏好視圖
     await send_log(f"✅ Bot 已啟動並就緒。版本：{bot.user.name}", "SUCCESS")
     print(f'Bot is ready to use.')
     
@@ -1271,7 +1111,7 @@ async def on_ready():
             # 檢查頻道中是否已有機器人發送的消息
             try:
                 async for message in tag_channel.history(limit=10):
-                    if message.author == bot.user and "機器人 Tag 偏好設置" in message.embeds[0].title if message.embeds else False:
+                    if message.author == bot.user and message.embeds and "機器人 Tag 偏好設置" in (message.embeds[0].title or ""):
                         await send_log(f"ℹ️ Tag 偏好設置消息已存在於 {tag_channel.name}，跳過重複發送。", "INFO")
                         print(f"✅ Tag 偏好設置消息已存在於 {tag_channel.name}，跳過重複發送。")
                         break
@@ -1365,62 +1205,31 @@ async def on_disconnect():
 # 定期檢查過期輔導申請
 @tasks.loop(hours=1)
 async def check_expired_tutoring_requests():
-    """每小時檢查一次是否有超過 24 小時未回應的申請"""
+    """先提交過期狀態，再通知；私訊失敗不影響其他申請。"""
     try:
-        connection = get_db_connection()
-        if not connection:
-            await send_log("⚠️ 無法連接資料庫進行過期檢查", "WARNING")
-            print("⚠️ 無法連接資料庫進行過期檢查")
-            return
-        
-        cursor = connection.cursor(dictionary=True)
-        
-        # 查詢所有未回應且超過 24 小時的申請
-        query = """
-            SELECT id, applicant_id, applicant_name, topic, message_id, created_at
-            FROM tutoring_requests
-            WHERE status = 'pending' AND created_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        """
-        cursor.execute(query)
-        expired_requests = cursor.fetchall()
-        
-        if expired_requests:
-            await send_log(f"⏰ 發現 {len(expired_requests)} 個過期的輔導申請，開始處理...", "WARNING")
-        
-        for request in expired_requests:
+        expired_requests = await asyncio.to_thread(tutoring_store.expire_requests)
+    except Error:
+        logger.exception("檢查過期輔導申請失敗")
+        return
+    request_channel = bot.get_channel(TUTORING_REQUEST_CHANNEL_ID)
+    for request in expired_requests:
+        if request['message_id'] is None:
+            continue
+        if request_channel is not None and request['message_id']:
             try:
-                applicant_id = request['applicant_id']
-                applicant = bot.get_user(applicant_id)
-                
-                if applicant:
-                    # 發送 DM 通知申請人
-                    embed = discord.Embed(
-                        title="⏰ 輔導申請已過期",
-                        description=f"您於 {request['created_at'].strftime('%Y-%m-%d %H:%M')} 提交的輔導申請「**{request['topic']}**」已超過 24 小時未被回應。\n\n"
-                                    "該申請現已標記為過期。若您仍需尋求輔導，請重新提交新的申請。",
-                        color=discord.Color.orange()
-                    )
-                    embed.set_footer(text="申請 ID: " + str(request['id']))
-                    await applicant.send(embed=embed)
-                    await send_log(f"✅ 已發送過期通知給 {request['applicant_name']} (ID: {applicant_id})", "SUCCESS")
-                    print(f"✅ 已發送過期通知給 {request['applicant_name']} (ID: {applicant_id})")
-                
-                # 更新資料庫狀態為 expired
-                cursor.execute("UPDATE tutoring_requests SET status = %s, closed_at = NOW() WHERE id = %s", ('expired', request['id']))
-                connection.commit()
-                
-            except Exception as e:
-                error_msg = f"❌ 處理過期申請時出錯 (ID: {request['id']}): {e}"
-                await send_log(error_msg, "ERROR")
-                print(error_msg)
-        
-        cursor.close()
-        connection.close()
-        
-    except Exception as e:
-        error_msg = f"❌ 檢查過期申請時出錯: {e}"
-        await send_log(error_msg, "ERROR")
-        print(error_msg)
+                message = await request_channel.fetch_message(request['message_id'])
+                await message.edit(view=None)
+            except discord.HTTPException:
+                logger.warning("無法移除過期申請按鈕 %s", request['id'], exc_info=True)
+        embed = discord.Embed(
+            title="⏰ 輔導申請已過期",
+            description=f"您的輔導申請「**{request['topic']}**」已超過 24 小時未被回應。若仍需要輔導，請重新提交申請。",
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text=f"申請 ID: {request['id']}")
+        await notify_tutoring_user(request['applicant_id'], embed=embed)
+    if expired_requests:
+        await send_log(f"⏰ 已將 {len(expired_requests)} 個輔導申請標記為過期。", "INFO")
 
 
 @check_expired_tutoring_requests.before_loop
@@ -1429,64 +1238,44 @@ async def before_check_expired_tutoring_requests():
     await bot.wait_until_ready()
 
 
+def get_archived_tutoring_channels():
+    with database_cursor(dictionary=True) as cursor:
+        cursor.execute(
+            """SELECT id, channel_id, channel_name FROM tutoring_channels
+               WHERE status = 'closed' AND closed_at < DATE_SUB(NOW(), INTERVAL 30 DAY)"""
+        )
+        return cursor.fetchall()
+
+
+def mark_tutoring_channel_deleted(record_id):
+    with database_cursor(write=True) as cursor:
+        cursor.execute(
+            "UPDATE tutoring_channels SET status = %s, deleted_at = NOW() WHERE id = %s",
+            ('deleted', record_id),
+        )
+
+
 # 定期刪除 30 天前關閉的輔導頻道
 @tasks.loop(hours=6)
 async def delete_archived_tutoring_channels():
-    """每 6 小時檢查一次，刪除 30 天前關閉的頻道"""
+    """Release DB connections before awaiting any Discord operations."""
     try:
-        connection = get_db_connection()
-        if not connection:
-            await send_log("⚠️ 無法連接資料庫進行刪除檢查", "WARNING")
-            print("⚠️ 無法連接資料庫進行刪除檢查")
-            return
-        
-        cursor = connection.cursor(dictionary=True)
-        
-        # 查詢所有已關閉超過 30 天的頻道
-        query = """
-            SELECT id, channel_id, channel_name
-            FROM tutoring_channels
-            WHERE status = 'closed' AND closed_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
-        """
-        cursor.execute(query)
-        channels_to_delete = cursor.fetchall()
-        
-        if channels_to_delete:
-            await send_log(f"🗑️ 發現 {len(channels_to_delete)} 個過期頻道，開始刪除...", "WARNING")
-        
-        for channel_record in channels_to_delete:
-            try:
-                channel_id = channel_record['channel_id']
-                channel = bot.get_channel(channel_id)
-                
-                if channel:
-                    # 刪除 Discord 頻道
+        channels = await asyncio.to_thread(get_archived_tutoring_channels)
+    except Error:
+        logger.exception("檢查過期頻道失敗")
+        return
+    for record in channels:
+        try:
+            channel = bot.get_channel(record['channel_id'])
+            if channel is not None:
+                try:
                     await channel.delete()
-                    await send_log(f"✅ 已刪除過期頻道 {channel_record['channel_name']} (ID: {channel_id})", "SUCCESS")
-                    print(f"✅ 已刪除過期頻道 {channel_record['channel_name']} (ID: {channel_id})")
-                else:
-                    await send_log(f"⚠️ 找不到頻道 (ID: {channel_id})，但會更新資料庫記錄", "WARNING")
-                    print(f"⚠️ 找不到頻道 (ID: {channel_id})，但會更新資料庫記錄")
-                
-                # 更新資料庫狀態為 deleted
-                cursor.execute(
-                    "UPDATE tutoring_channels SET status = %s, deleted_at = NOW() WHERE id = %s",
-                    ('deleted', channel_record['id'])
-                )
-                connection.commit()
-                
-            except Exception as e:
-                error_msg = f"❌ 刪除頻道時出錯 (ID: {channel_record['channel_id']}): {e}"
-                await send_log(error_msg, "ERROR")
-                print(error_msg)
-        
-        cursor.close()
-        connection.close()
-        
-    except Exception as e:
-        error_msg = f"❌ 檢查過期頻道時出錯: {e}"
-        await send_log(error_msg, "ERROR")
-        print(error_msg)
+                except discord.NotFound:
+                    pass  # Already deleted on Discord; finish updating the DB.
+            await asyncio.to_thread(mark_tutoring_channel_deleted, record['id'])
+            await send_log(f"✅ 已清理過期頻道 {record['channel_name']} (ID: {record['channel_id']})", "SUCCESS")
+        except (Error, discord.HTTPException):
+            logger.exception("刪除過期頻道失敗 (ID: %s)", record['channel_id'])
 
 
 @delete_archived_tutoring_channels.before_loop
@@ -1496,17 +1285,13 @@ async def before_delete_archived_tutoring_channels():
 
 
 # 每日早上 10 點傳送今日課表
-@tasks.loop(hours=24)
+@tasks.loop(time=dt_time(hour=10, minute=0, tzinfo=timezone(timedelta(hours=8))))
 async def send_daily_schedule():
     """每天早上 10 點傳送今日課表"""
     try:
-        # 檢查當前時間是否為早上 10 點
+        # 使用 UTC+8 日期查詢當日課表
         tz = timezone(timedelta(hours=8))
         now = datetime.now(tz)
-        
-        # 只在早上 10:00-10:05 之間執行（確保只執行一次）
-        if now.hour != 10 or now.minute >= 5:
-            return
         
         # 取得課表頻道
         schedule_channel = bot.get_channel(DAILY_SCHEDULE_CHANNEL_ID)
@@ -1523,6 +1308,7 @@ async def send_daily_schedule():
             print("⚠️ 無法連接資料庫進行課表查詢")
             return
 
+        cursor = None
         try:
             cursor = connection.cursor(dictionary=True)
             cursor.execute("""
@@ -1562,14 +1348,13 @@ async def send_daily_schedule():
             await schedule_channel.send(embed=embed)
             await send_log(f"✅ 已於 {now.strftime('%Y-%m-%d %H:%M')} 傳送今日課表到頻道", "SUCCESS")
             print(f"✅ 已於 {now.strftime('%Y-%m-%d %H:%M')} 傳送今日課表到頻道")
-            cursor.close()
             
         except Error as e:
             error_msg = f"❌ 查詢課表失敗: {e}"
             await send_log(error_msg, "ERROR")
             print(error_msg)
         finally:
-            connection.close()
+            close_db_resources(cursor, connection)
             
     except Exception as e:
         error_msg = f"❌ 傳送每日課表時出錯: {e}"
@@ -1597,6 +1382,9 @@ schedule_group = app_commands.Group(name="schedule", description="課表相關�
     description="課程內容的詳細說明"
 )
 async def add_class(interaction: discord.Interaction, date: str, stime: str, etime: str, title: str, description: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ 請在伺服器中使用此指令。", ephemeral=True)
+        return
     # 簡易的權限檢查，只允許有 "鎮民" 角色的使用者操作
     if not any(role.name == '鎮民' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有鎮民才能新增課程。", ephemeral=True)
@@ -1619,6 +1407,7 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
         await send_log(f"❌ 無法連接資料庫以新增課程 (使用者: {interaction.user.name})", "ERROR")
         return
 
+    cursor = None
     try:
         cursor = connection.cursor()
         
@@ -1631,8 +1420,6 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
         
         if cursor.fetchone():
             await interaction.response.send_message("❌ 此課程已存在，請勿重複新增。", ephemeral=True)
-            cursor.close()
-            connection.close()
             return
         
         # 插入新課程
@@ -1648,16 +1435,15 @@ async def add_class(interaction: discord.Interaction, date: str, stime: str, eti
         await send_log(log_msg, "SUCCESS")
         print(log_msg)
         
-        cursor.close()
         
     except Error as e:
         error_msg = f"❌ 新增課程失敗: {e}"
         await send_log(error_msg, "ERROR")
         print(error_msg)
-        await interaction.response.send_message(f"❌ 新增課程失敗：{str(e)}", ephemeral=True)
-        connection.rollback()
+        await interaction.response.send_message("❌ 新增課程失敗，請稍後重試。", ephemeral=True)
+        safe_db_call(connection.rollback)
     finally:
-        connection.close()
+        close_db_resources(cursor, connection)
 
 @schedule_group.command(name="today", description="查詢今日課表")
 async def today_schedule(interaction: discord.Interaction):
@@ -1672,6 +1458,7 @@ async def today_schedule(interaction: discord.Interaction):
         await send_log(f"❌ 無法連接資料庫以查詢今日課表 (使用者: {interaction.user.name})", "ERROR")
         return
 
+    cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
         cursor.execute("""
@@ -1709,16 +1496,14 @@ async def today_schedule(interaction: discord.Interaction):
             
         await interaction.followup.send(embed=embed)
         await send_log(f"✅ {interaction.user.name} (ID: {interaction.user.id}) 查詢了今日課表", "SUCCESS")
-        cursor.close()
         
     except Error as e:
         error_msg = f"❌ 查詢課表失敗: {e}"
         await send_log(error_msg, "ERROR")
         print(error_msg)
-        await interaction.followup.send(f"❌ 查詢課表失敗：{str(e)}", ephemeral=True)
+        await interaction.followup.send("❌ 查詢課表失敗，請稍後重試。", ephemeral=True)
     finally:
-        if connection.is_connected():
-            connection.close()
+        close_db_resources(cursor, connection)
 
 @schedule_group.command(name="view", description="查詢指定日期的課表")
 @app_commands.describe(date="要查詢的日期 (格式：YYYY-MM-DD)")
@@ -1736,6 +1521,7 @@ async def view_schedule(interaction: discord.Interaction, date: str):
         await send_log(f"❌ 無法連接資料庫以查詢課表 (使用者: {interaction.user.name})", "ERROR")
         return
 
+    cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
         cursor.execute("""
@@ -1772,16 +1558,14 @@ async def view_schedule(interaction: discord.Interaction, date: str):
             
         await interaction.followup.send(embed=embed)
         await send_log(f"✅ {interaction.user.name} (ID: {interaction.user.id}) 查詢了 {date} 的課表", "SUCCESS")
-        cursor.close()
         
     except Error as e:
         error_msg = f"❌ 查詢課表失敗: {e}"
         await send_log(error_msg, "ERROR")
         print(error_msg)
-        await interaction.followup.send(f"❌ 查詢課表失敗：{str(e)}", ephemeral=True)
+        await interaction.followup.send("❌ 查詢課表失敗，請稍後重試。", ephemeral=True)
     finally:
-        if connection.is_connected():
-            connection.close()
+        close_db_resources(cursor, connection)
 
 @schedule_group.command(name="edit", description="修改一堂課的資訊")
 @app_commands.describe(
@@ -1796,6 +1580,9 @@ async def view_schedule(interaction: discord.Interaction, date: str):
 async def edit_class(interaction: discord.Interaction, date: str, stime: str, 
                      new_date: str = None, new_stime: str = None, new_etime: str = None,
                      new_title: str = None, new_description: str = None):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ 請在伺服器中使用此指令。", ephemeral=True)
+        return
     # 權限檢查
     if not any(role.name == '鎮民' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有鎮民才能修改課程。", ephemeral=True)
@@ -1824,6 +1611,7 @@ async def edit_class(interaction: discord.Interaction, date: str, stime: str,
         await send_log(f"❌ 無法連接資料庫以修改課程 (使用者: {interaction.user.name})", "ERROR")
         return
 
+    cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
         
@@ -1847,8 +1635,6 @@ async def edit_class(interaction: discord.Interaction, date: str, stime: str,
             else:
                 await interaction.response.send_message(f"❌ 在 {date} {stime} 沒有找到課程。", ephemeral=True)
             
-            cursor.close()
-            connection.close()
             return
         
         # 準備更新的值（使用原始值或新值）
@@ -1869,8 +1655,6 @@ async def edit_class(interaction: discord.Interaction, date: str, stime: str,
         
         if cursor.fetchone():
             await interaction.response.send_message("❌ 修改後的課程與其他課程衝突，請檢查時間。", ephemeral=True)
-            cursor.close()
-            connection.close()
             return
         
         # 更新課程
@@ -1906,16 +1690,15 @@ async def edit_class(interaction: discord.Interaction, date: str, stime: str,
         await send_log(log_msg, "SUCCESS")
         print(log_msg)
         
-        cursor.close()
         
     except Error as e:
         error_msg = f"❌ 修改課程失敗: {e}"
         await send_log(error_msg, "ERROR")
         print(error_msg)
-        await interaction.response.send_message(f"❌ 修改課程失敗：{str(e)}", ephemeral=True)
-        connection.rollback()
+        await interaction.response.send_message("❌ 修改課程失敗，請稍後重試。", ephemeral=True)
+        safe_db_call(connection.rollback)
     finally:
-        connection.close()
+        close_db_resources(cursor, connection)
 
 
 @schedule_group.command(name="cancel", description="取消一堂課")
@@ -1924,6 +1707,9 @@ async def edit_class(interaction: discord.Interaction, date: str, stime: str,
     time="課程時間 (格式：HH:MM)"
 )
 async def cancel_class(interaction: discord.Interaction, date: str, time: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ 請在伺服器中使用此指令。", ephemeral=True)
+        return
     # 權限檢查
     if not any(role.name == '鎮民' for role in interaction.user.roles):
         await interaction.response.send_message("抱歉，只有鎮民才能取消課程。", ephemeral=True)
@@ -1944,6 +1730,7 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
         await send_log(f"❌ 無法連接資料庫以取消課程 (使用者: {interaction.user.name})", "ERROR")
         return
 
+    cursor = None
     try:
         cursor = connection.cursor(dictionary=True)
         
@@ -1967,8 +1754,6 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
             else:
                 await interaction.response.send_message(f"❌ 在 {date} {time} 沒有找到課程。", ephemeral=True)
             
-            cursor.close()
-            connection.close()
             return
         
         # 刪除課程
@@ -1987,23 +1772,22 @@ async def cancel_class(interaction: discord.Interaction, date: str, time: str):
         await send_log(log_msg, "SUCCESS")
         print(log_msg)
         
-        cursor.close()
         
     except Error as e:
         error_msg = f"❌ 取消課程失敗: {e}"
         await send_log(error_msg, "ERROR")
         print(error_msg)
-        await interaction.response.send_message(f"❌ 取消課程失敗：{str(e)}", ephemeral=True)
-        connection.rollback()
+        await interaction.response.send_message("❌ 取消課程失敗，請稍後重試。", ephemeral=True)
+        safe_db_call(connection.rollback)
     finally:
-        connection.close()
+        close_db_resources(cursor, connection)
 
 bot.tree.add_command(schedule_group)
 
 @bot.tree.command(name="apply-tutoring", description="申請一對一線上輔導")
 async def apply_tutoring(interaction: discord.Interaction):
-    await send_log(f"📝 使用者 {interaction.user.name} (ID: {interaction.user.id}) 開啟了輔導申請表", "INFO")
     await interaction.response.send_modal(TutoringApplyModal())
+    await send_log(f"📝 使用者 {interaction.user.name} (ID: {interaction.user.id}) 開啟了輔導申請表", "INFO")
 
 # 2. 匿名檢舉指令
 @bot.tree.command(name="apply", description="📨 微光鎮｜站務申請與回報系統")
@@ -2102,6 +1886,10 @@ async def rules(interaction: discord.Interaction):
 async def setup_tag_preference(interaction: discord.Interaction):
     """在 TAG_PREFERENCE_CHANNEL_ID 頻道中放置 Tag 偏好設置消息"""
     
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ 請在伺服器中使用此指令。", ephemeral=True)
+        return
+
     # 驗證是否為管理員
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ 只有管理員可以執行此指令。", ephemeral=True)
@@ -2148,9 +1936,14 @@ async def setup_tag_preference(interaction: discord.Interaction):
         await send_log(error_msg, "ERROR")
         print(error_msg)
         await interaction.response.send_message(
-            f"❌ 操作失敗：{str(e)}",
+            "❌ 操作失敗，請稍後重試或聯絡管理員。",
             ephemeral=True
         )
 
 # --- 啟動 Bot ---
-bot.run(DISCORD_BOT_TOKEN)
+if __name__ == '__main__':
+    load_dotenv()
+    load_configuration(required=True)
+    configure_logging()
+    initialize_database()
+    bot.run(DISCORD_BOT_TOKEN)
